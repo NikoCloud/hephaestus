@@ -26,6 +26,8 @@ Every constant the Hephaestus forward pass will hard-code, sourced.
 
 Embedding shape: `[151936, 2560]` — the LM head shares this weight matrix (no separate output projection). This means the final matmul is `[hidden=2560, vocab=151936]` using the transposed embedding.
 
+> **⚠ Tied embeddings — loader assertion required:** There is no separate `lm_head.weight` tensor in the safetensors file. The LM head *is* `model.embed_tokens.weight` transposed. The loader must **assert** this at load time: if a file contains both `embed_tokens.weight` and `lm_head.weight`, verify they share the same `data_ptr()`. If only `embed_tokens.weight` exists, use it for both. Do not assume — assert.
+
 ## 3. Transformer Blocks (×36)
 
 | Constant | Value | Source |
@@ -51,6 +53,8 @@ Embedding shape: `[151936, 2560]` — the LM head shares this weight matrix (no 
 | V projection | `[2560, 8×128=1024]` | No bias |
 | O projection | `[4096, 2560]` | No bias (output, 4096 = 32 heads × 128 head_dim) |
 | Scale factor | `1/sqrt(128)` ≈ 0.0884 | Standard 1/sqrt(head_dim) |
+
+> **⚠ Non-square projections:** Qwen3 decouples `head_dim` from `hidden_size / num_heads`. With hidden=2560, 32 heads, and head_dim=128, the Q projection output is `32×128=4096`, **not** `hidden_size=2560`. So `q_proj` is a non-square `2560→4096` matrix and `o_proj` comes back `4096→2560`. K/V projections are `2560→1024` (8×128). Do **not** assume projection output = hidden size — this is the classic autopilot trap that produces silent shape mismatches.
 
 ### 3b. QK Normalization
 
@@ -111,6 +115,8 @@ The tokenizer uses the `<|im_start|>` / `<|im_end|>` pattern:
 ```
 
 For Phase 1a, the CLI takes a raw prompt string (no chat template). The oracle fixtures will use raw prompts too — tokenizing directly without chat formatting.
+
+> **⚠ Tokenizer parity — G1a-1 gate caveat:** Token-identical comparison only validates the forward pass if both sides consume *identical input token IDs*. The oracle fixtures saved raw input token IDs (`promptN_input_ids.json`). Hephaestus must feed those exact IDs directly rather than re-tokenizing text through its own tokenizer path. A whitespace-handling or BPE-merge difference in a vendored tokenizer will produce subtly different token IDs, causing a token mismatch that looks like a forward-pass bug but is actually a tokenizer bug. When the time comes, test tokenizer parity first: run the vendored tokenizer on the same 3 prompt strings, diff against the saved IDs, and only then compare generation output.
 
 ## 6. Tensor Inventory (per layer, BF16)
 
