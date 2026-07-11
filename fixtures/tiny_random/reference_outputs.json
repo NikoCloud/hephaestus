@@ -1,0 +1,108 @@
+[
+  {
+    "prompt_index": 0,
+    "input_ids": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "output_ids": [
+      0,
+      1,
+      2,
+      3,
+      3,
+      3,
+      3,
+      3,
+      3,
+      3,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30
+    ],
+    "num_input_tokens": 4,
+    "num_output_tokens": 20,
+    "num_new_tokens": 16
+  },
+  {
+    "prompt_index": 1,
+    "input_ids": [
+      10,
+      20,
+      30,
+      40,
+      50
+    ],
+    "output_ids": [
+      10,
+      20,
+      30,
+      40,
+      50,
+      50,
+      50,
+      50,
+      50,
+      50,
+      50,
+      50,
+      50,
+      50,
+      50,
+      50,
+      50,
+      50,
+      50,
+      50,
+      50
+    ],
+    "num_input_tokens": 5,
+    "num_output_tokens": 21,
+    "num_new_tokens": 16
+  },
+  {
+    "prompt_index": 2,
+    "input_ids": [
+      100,
+      200,
+      255,
+      5,
+      10
+    ],
+    "output_ids": [
+      100,
+      200,
+      255,
+      5,
+      10,
+      10,
+      10,
+      10,
+      10,
+      10,
+      10,
+      10,
+      10,
+      10,
+      10,
+      10,
+      10,
+      10,
+      10,
+      10,
+      10
+    ],
+    "num_input_tokens": 5,
+    "num_output_tokens": 21,
+    "num_new_tokens": 16
+  }
+]

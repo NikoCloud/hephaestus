@@ -1,0 +1,116 @@
+{
+  "seed": 42,
+  "model_type": "Qwen3ForCausalLM",
+  "torch_dtype": "bfloat16",
+  "config": {
+    "transformers_version": "5.13.1",
+    "architectures": null,
+    "output_hidden_states": false,
+    "return_dict": true,
+    "dtype": "bfloat16",
+    "chunk_size_feed_forward": 0,
+    "is_encoder_decoder": false,
+    "id2label": {
+      "0": "LABEL_0",
+      "1": "LABEL_1"
+    },
+    "label2id": {
+      "LABEL_0": 0,
+      "LABEL_1": 1
+    },
+    "problem_type": null,
+    "vocab_size": 256,
+    "hidden_size": 128,
+    "intermediate_size": 256,
+    "num_hidden_layers": 2,
+    "num_attention_heads": 4,
+    "num_key_value_heads": 2,
+    "head_dim": 32,
+    "hidden_act": "silu",
+    "max_position_embeddings": 32768,
+    "initializer_range": 0.02,
+    "rms_norm_eps": 1e-06,
+    "use_cache": true,
+    "tie_word_embeddings": true,
+    "rope_parameters": {
+      "rope_theta": 10000.0,
+      "rope_type": "default"
+    },
+    "attention_bias": false,
+    "use_sliding_window": false,
+    "sliding_window": null,
+    "max_window_layers": 28,
+    "layer_types": [
+      "full_attention",
+      "full_attention"
+    ],
+    "attention_dropout": 0.0,
+    "pad_token_id": null,
+    "bos_token_id": null,
+    "eos_token_id": null,
+    "_name_or_path": "",
+    "model_type": "qwen3",
+    "output_attentions": false
+  },
+  "prompts": [
+    [
+      0,
+      1,
+      2,
+      3
+    ],
+    [
+      10,
+      20,
+      30,
+      40,
+      50
+    ],
+    [
+      100,
+      200,
+      255,
+      5,
+      10
+    ]
+  ],
+  "num_new_tokens": 16,
+  "num_prompts": 3,
+  "reference_outputs_file": "reference_outputs.json",
+  "model_file": "model.safetensors",
+  "config_file": "config.json",
+  "state_dict_num_tensors": 25,
+  "state_dict_keys": [
+    "model.embed_tokens.weight",
+    "model.layers.0.self_attn.q_proj.weight",
+    "model.layers.0.self_attn.k_proj.weight",
+    "model.layers.0.self_attn.v_proj.weight",
+    "model.layers.0.self_attn.o_proj.weight",
+    "model.layers.0.self_attn.q_norm.weight",
+    "model.layers.0.self_attn.k_norm.weight",
+    "model.layers.0.mlp.gate_proj.weight",
+    "model.layers.0.mlp.up_proj.weight",
+    "model.layers.0.mlp.down_proj.weight",
+    "model.layers.0.input_layernorm.weight",
+    "model.layers.0.post_attention_layernorm.weight",
+    "model.layers.1.self_attn.q_proj.weight",
+    "model.layers.1.self_attn.k_proj.weight",
+    "model.layers.1.self_attn.v_proj.weight",
+    "model.layers.1.self_attn.o_proj.weight",
+    "model.layers.1.self_attn.q_norm.weight",
+    "model.layers.1.self_attn.k_norm.weight",
+    "model.layers.1.mlp.gate_proj.weight",
+    "model.layers.1.mlp.up_proj.weight",
+    "model.layers.1.mlp.down_proj.weight",
+    "model.layers.1.input_layernorm.weight",
+    "model.layers.1.post_attention_layernorm.weight",
+    "model.norm.weight",
+    "lm_head.weight"
+  ],
+  "generation": {
+    "method": "greedy",
+    "do_sample": false,
+    "top_k": 1
+  },
+  "purpose": "Tiny random Qwen3 oracle for millisecond debug loops \u2014 verify forward pass end-to-end quickly."
+}
