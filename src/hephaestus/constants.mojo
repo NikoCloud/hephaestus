@@ -3,6 +3,8 @@
 # All values sourced from docs/architecture-dossier.md §7
 # ===----------------------------------------------------------------------=== #
 
+from std.math import sqrt
+
 comptime VOCAB_SIZE = 151936
 comptime HIDDEN_SIZE = 2560
 comptime NUM_LAYERS = 36
