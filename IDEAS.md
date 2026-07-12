@@ -12,3 +12,4 @@
 | 2026-07-11 | KV-cache FP8 | Phase 3 | YES |
 | 2026-07-12 | Upstream a gfx12 WMMA fragment path to Mojo stdlib (RDNA4 8-elem A/B) | Phase 1b | ✅ |
 | 2026-07-12 | Hand-write RDNA4 WMMA inline asm if upstream stalls (v_wmma_f32_16x16x16_bf16) | Phase 1b | ✅ |
+| 2026-07-12 | Launch-overhead profiling + QK-norm fusion: high-value once batching arrives and reduction-order sensitivity matters less | Phase 2 | ✅ |
