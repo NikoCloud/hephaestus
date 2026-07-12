@@ -33,6 +33,7 @@ Focused evidence for prompt 1, teacher-forced step 67, token 96874.
 | 12 | FP8 widening bar on measured delta | `python3 experiments/spike/probe12_fp8_margin.py` (needs `/tmp` logit artifacts) |
 | 13 | Q cut-points + replace-and-continue | `sh experiments/spike/run_probe13.sh` → `out/probe13_q_cuts.json` |
 | 14 | RoPE sub-step root cause | `python3 experiments/spike/probe14_rope_substep.py` (needs probe-13 dumps) |
+| 15 | q_proj accum vs HF (prefill naive matmul) | build/run `probe15_qproj_accum.mojo dump` then `run_py_gpu.sh probe15_qproj_accum.py` |
 
 `spike_forward.mojo` adds snapshots to the production operation order. `spike_kernels.mojo` copies production attention and parameterizes only probability/score rounding for probe 9. Its production control must reproduce target value `16.312086` exactly.
 

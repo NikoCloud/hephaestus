@@ -287,9 +287,55 @@ Slight improvement; **not** cleared. `out/probe12_fp8_margin_post_rope_fix.json`
 
 Prompt 3 improved; prompt 1 spike intact.
 
-## Next discriminating probe (remaining seed)
+## Probe 15 — q_proj accumulation (2026-07-12)
 
-`q_proj` matmul at layer 0 (and likely all layers): compare Hephaestus `matmul_kernel_naive` / GEMM path to HF Linear on the same normed residual. Options: match reduction order, accumulate in higher precision then cast, or vendor a path that bit-matches torch on this shape. Separate from the RoPE fix.
+**Hypothesis under test:** gemv / matmul f32 accum is “too accurate”; force BF16 accum to match HF.
+
+### Path fact (non-negotiable)
+
+Prefill anomaly uses **`m = 77` → `matmul_kernel_naive`**, not `gemv_gpu` (`m == 1` decode only). Both use **f32 accumulation** then cast to bf16 (`get_accum_type[bf16]`).
+
+### Elementwise dumps (layer 0, exact-prefix)
+
+| tensor | Heph vs HF | n_bf16_diff |
+|---|---|---:|
+| input_layernorm `xn` | **bit-identical** (rel 0) | **0** |
+| `q_proj` output | rel **9.88e-5**, max abs **0.00195** | **110 / 315392** |
+| target-row `q_proj` | rel **1.89e-5** | **2** cols (105, 890) |
+
+### Recompute on identical `xn` and `W`
+
+| recompute | vs HF q_proj | vs Heph q_proj |
+|---|---:|---:|
+| sequential **f32-accum** then bf16 cast | rel 9.88e-5 | **rel 0 (bit-identical)** |
+| bf16 stepwise accum (target row) | rel **0.126** | rel **0.126** |
+| bf16 chunk-64 accum | rel 0.0093 | rel 0.0093 |
+
+**Hephaestus is bit-exact sequential f32-accum.** HF Linear disagrees with that reference in the same 110 elements. Pure bf16 accum is **farther from both**, not closer to HF.
+
+### Hybrid inject (causal)
+
+| inject payload | logit[96874] | abs vs HF 4.25 |
+|---|---:|---:|
+| control (native) | 16.380 | 12.130 |
+| full HF q_proj | 4.713 | 0.463 |
+| **hybrid: only the 110 differing elems → HF** | **4.713** | **0.463** |
+| heph-self re-inject | 16.380 | 12.130 |
+
+Those **110 ULP-level elements alone** collapse the spike. Not a global mis-accumulation mode.
+
+### Verdict
+
+| claim | status |
+|---|---|
+| Bug is gemv inner loop | **RULED OUT** (wrong kernel for this path) |
+| Force BF16 accum to match HF | **RULED OUT** (wrong direction; worsens vs HF) |
+| Heph q_proj mis-implemented vs f32 sum | **RULED OUT** (bit-exact match) |
+| Residual seed = sparse torch-vs-sequential f32 matmul ULPs, amplified | **SUPPORTED** |
+
+**Fix direction (not applied):** match **torch/ROCm matmul reduction/blocking** for BF16×BF16→BF16 with f32 accum (same algorithm as HF Linear), not “less accurate bf16 accum.” Alternatively, document residual as ULP-sensitivity if a broader FP8 bar is cleared by other means.
+
+Evidence: `out/probe15_qproj_accum.json`, `probe15_qproj_accum.{mojo,py}`.
 
 ## Artifact map
 
