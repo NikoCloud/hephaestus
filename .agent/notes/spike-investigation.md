@@ -25,18 +25,20 @@ Re-verified from the five on-disk `/tmp/spike-det-1783875368/rep{1..5}_logits.f3
 
 ## Verdict
 
-**UNRESOLVED as to a single initiating arithmetic defect. NOT benign under the FP8 bar. Search space is materially narrowed. Do not clear the Phase 1b entry gate.**
+**Root cause localized to layer-0 (and by structure, every-layer) RoPE on Q — with positive replace-and-continue evidence. NOT a full single-line proof inside `rope_kernel`. NOT benign under the FP8 bar. Do not clear the Phase 1b entry gate until a RoPE fix is validated.**
 
 What is established:
 
 1. The event is **deterministic, row-wide, and upstream of the LM head**, then amplified through depth on phase-locked ill-conditioned rows.
-2. The layer-0 **seed** is small (~0.17% relative on attention out) and **within HF's own eager-vs-SDPA self-spread** at that cut (~0.19%). Most of that seed already lives in the **Q path** (post-RoPE Q relative error ~0.16%); V is ~14× cleaner.
-3. No single kernel has been shown to be *the* cause. Probability-BF16 rounding is a **contributor**, not the sole cause. RoPE trig precision alone was previously ruled out.
-4. **Benign is rejected** under the deliverable's FP8 standard (not "harmless at BF16 today"):
-   - Concrete E4M3 candidate (probe 8): **3 clear** non-tie flips (weights) / **6 clear** (weights+activations) across 768 rows.
-   - Magnification model (probe 12): magnifying the measured Hephaestus−HF logit delta by the rough E4M3/BF16 mantissa ratio (~16×) produces **81 non-tie** rows that flip. The canonical spike row itself flips at only **S ≈ 2.18**.
+2. **Probe 13 cut-points (layer 0 Q):** relative error vs HF SDPA is tiny at `q_proj` (**9.88e-5**) and `q_norm` (**1.05e-4**, ×1.06), then jumps **×15.7 at RoPE** to **1.64e-3**. First elevated cut = **`q_rope`**.
+3. **Probe 13 replace-and-continue:** overwriting Hephaestus Q with HF's tensor at each cut, then continuing Hephaestus layers 0…35:
+   - `inject_q_proj` / `inject_q_norm`: partial relief (hidden rel 0.335 → 0.120; target logit 16.31 → 6.36). **Does not collapse** under the predeclared 25% rule.
+   - **`inject_q_rope`: collapses** (hidden rel → **0.038**, ratio **0.114**; target logit → **4.054** vs HF **4.25**, abs diff **0.196** = 1.6% of the original 12.06 gap).
+4. Therefore the **initiating Q-path defect is in RoPE application** (freq / cast / rotate composition in `apply_rope_inplace` / `rope_kernel`), not in `q_proj` matmul or `q_norm`. Raw GPU `cos`/`sin` accuracy alone remains ruled out (exp6); the mismatch is in the **RoPE pipeline as composed**, not bare trig ULP.
+5. Residual after Q-RoPE inject (hidden rel 0.038, still above quiet-row ~0.02) means K-RoPE / attention / later layers still contribute ordinary BF16 noise — but they are **not** what creates the 12-unit spike.
+6. **Benign is rejected** under the FP8 standard (probes 8 and 12 unchanged).
 
-What is **not** established: a single line of engine code that, if changed, collapses the row-wide error to the HF ensemble. That remains the next discriminating experiment (component-matched intervention continuing from the layer-0 Q seed).
+What is **not** established: which exact expression inside `rope_kernel` (inv-freq construction, bf16 cast placement, rotate_half pairing, or multiply-add order) is the wrong step. That is the next one-line fix candidate, not a new search across the whole model.
 
 ## Corrected anomaly shape
 
@@ -82,8 +84,11 @@ Future-token leakage and row misalignment are **ruled out**. Cached vs one-shot 
 | BF16 score rounding missing | adding score rounding converges to HF | target stays 11.86; median 1.267 | **RULED OUT as fix** |
 | Seed is inside attention kernel only | post-RoPE Q/K/V match; only attn_out diverges | Q tgt rel **0.00159** ≈ attn_out **0.00174**; V all rel **0.000115** (~14× smaller) | **Attention-only seed RULED OUT**; seed is **mostly Q-path**, already present pre-attention |
 | Layer-0 seed is abnormal vs HF self-variation | Hephaestus L0 ≫ HF eager-vs-SDPA | Heph L0 attn rel 0.00174 vs HF self-spread **0.00191** (ratio 0.91) | **Seed magnitude is within HF self-spread** |
-| Deterministic amplification / ill-conditioning | independent perturbations + HF self-spread peak on same phase families; error grows with depth | phase 3/7 dominate; corr(log amp, log HF self-spread)=**0.9066**; layerwise growth observed | **SUPPORTED** (mechanism class, not a line-of-code root cause) |
-| Hephaestus inside a defensible BF16 ensemble | measured independent impls bracket Hephaestus | HF eager−SDPA hidden spread at row 67: **0.046**; Heph−SDPA: **0.335** | **NOT ESTABLISHED** — Hephaestus is an outlier vs the HF ensemble at the final hidden, despite a normal-sized layer-0 seed |
+| Deterministic amplification / ill-conditioning | independent perturbations + HF self-spread peak on same phase families; error grows with depth | phase 3/7 dominate; corr(log amp, log HF self-spread)=**0.9066**; layerwise growth observed | **SUPPORTED** (mechanism after seed) |
+| Hephaestus inside a defensible BF16 ensemble | measured independent impls bracket Hephaestus | HF eager−SDPA hidden spread at row 67: **0.046**; Heph−SDPA: **0.335** | **NOT ESTABLISHED** at final hidden (seed is normal-sized; amplification is not) |
+| Seed is `q_proj` matmul | cut error large at post-`q_proj`; inject collapses | cut rel **9.88e-5**; inject ratio 0.36 (not collapsed) | **RULED OUT as primary** |
+| Seed is `q_norm` | cut error jumps at post-`q_norm`; inject collapses | cut rel **1.05e-4** (×1.06 vs proj); inject **identical** to `q_proj` inject | **RULED OUT as primary** |
+| Seed is RoPE on Q | cut error jumps at post-RoPE; inject collapses final spike | cut rel **1.64e-3** (**×15.7**); inject hidden ratio **0.114**, logit gap 12.06→**0.20** | **SUPPORTED — positive causal evidence** |
 | Benign under FP8 widening | no clear argmax flips when error is coarsened to E4M3-class | probe 8: 3 / 6 clear flips; probe 12: **81 non-tie** rows with `s_flip ≤ 16`; spike row `s_flip ≈ 2.18` | **BENIGN REJECTED** |
 
 ### Hidden-state / projection evidence
@@ -109,9 +114,9 @@ HF post-rotary Q/K/V captured from the real `apply_rotary_pos_emb` path (not a r
 
 HF eager vs SDPA attention-out rel at the same cut: **0.001913**.
 
-**Interpretation:** the first divergence is a normal-sized BF16 implementation delta concentrated on the **Q path** (q_proj / q_norm / RoPE composition). It is **not** a catastrophic attention-kernel bug at layer 0. The pathology is **amplification** of that seed through 36 layers on sensitive rows — final hidden error is ~7× the HF eager/SDPA ensemble spread.
+**Interpretation (updated by probe 13):** the first divergence is a normal-sized BF16 delta concentrated on **post-RoPE Q** (not `q_proj`/`q_norm`). It is **not** a catastrophic attention-kernel bug at layer 0. The pathology is **amplification** of that RoPE seed through 36 layers on sensitive rows — final hidden error is ~7× the HF eager/SDPA ensemble spread. Replace-and-continue with HF post-RoPE Q collapses the spike (see Probe 13).
 
-Evidence: `probe11_layer0_seed.json`, `probe11_qkv_hfrope.json`, `probe4_bisect.json`.
+Evidence: `probe11_layer0_seed.json`, `probe11_qkv_hfrope.json`, `probe4_bisect.json`, `probe13_q_cuts.json`.
 
 ### Conditioning evidence and its limit
 
@@ -155,19 +160,50 @@ Even without inventing new quantization noise, **simply magnifying the existing 
 
 Evidence: `probe8_fp8.json`, `probe12_fp8_margin.json`.
 
+## Probe 13 — Q cut-points + replace-and-continue (2026-07-12)
+
+Exact-prefix seq=77, target row=76 (prompt1 step 67). HF SDPA vs eager Q cuts are **bit-identical** (pre-attention path shared).
+
+### Cut-point relative L2 (Hephaestus vs HF SDPA, full `[77,32,128]`)
+
+| cut | all_rel | tgt_rel | all_max_abs | growth vs previous |
+|---|---:|---:|---:|---:|
+| post `q_proj` | **9.88e-5** | 1.89e-5 | 0.00195 | — |
+| post `q_norm` | **1.05e-4** | 2.18e-5 | 0.03125 | ×1.06 |
+| post RoPE | **1.64e-3** | 1.59e-3 | 0.0625 | **×15.7** |
+
+**First elevated cut: `q_rope`.**
+
+### Replace-and-continue (inject HF SDPA Q at cut, continue Hephaestus)
+
+Predeclared collapse rule: final hidden rel < 25% of control (control = 0.3345).
+
+| mode | hidden_rel vs HF | collapse_ratio | logit[96874] | abs diff vs HF 4.25 |
+|---|---:|---:|---:|---:|
+| control | 0.3345 | 1.000 | **16.312** | **12.062** |
+| inject_q_proj | 0.1199 | 0.358 | 6.363 | 2.113 |
+| inject_q_norm | 0.1199 | 0.358 | 6.363 | 2.113 |
+| **inject_q_rope** | **0.0382** | **0.114** | **4.054** | **0.196** |
+
+`inject_q_proj` and `inject_q_norm` are **numerically identical** end-to-end (same `||h||`, same logits) — `q_norm` adds no independent defect. Both leave the broken Hephaestus RoPE in the path, so they cannot fully clear the spike. Only forcing post-RoPE Q to the HF reference collapses it.
+
+**Causal reading:** the 12-unit spike is the amplification of a **RoPE-composed Q mismatch**, not of `q_proj`/`q_norm`. Fixing RoPE (and validating K similarly) is the engine-side remediation path; do not chase matmul or RMSNorm for this anomaly.
+
+Evidence: `experiments/spike/out/probe13_q_cuts.json`, `probe13_q_cuts.mojo`, `probe13_hf_q_cuts.py`, `run_probe13.sh`.
+
 ## Narrowest next discriminating probe
 
-The layer-0 seed is now localized to the **Q path** at normal BF16 magnitude. Next:
+Inside `rope_kernel` / HF `apply_rotary_pos_emb`, isolate which sub-step diverges:
 
-1. Dump intermediate Q after `q_proj`, after `q_norm`, and after RoPE separately (Hephaestus vs HF) for the target row and a control row.
-2. Predeclared predictions:
-   - if error appears at `q_proj` → matmul reduction-order (naive GPU vs torch) is the initiator;
-   - if error appears at `q_norm` → RMSNorm path (despite exp4 bit-exact on pure norms — check in-place / layout interaction);
-   - if error appears only after RoPE → freq/cast composition (not raw `cos` accuracy);
-   - if all three match and only full-stack Q differs → dump-path bug.
-3. Then run a **replace-and-continue** intervention: swap Hephaestus's layer-0 Q (or attn out) for HF's, run layers 1…35 unchanged, and test whether final row-67 hidden collapse occurs.
+1. Dump per-pair `cos`/`sin` (bf16) for positions 0…76 and pair indices 0…63 from both sides.
+2. Dump one head's pre-RoPE Q and post-RoPE Q elementwise; check whether the closed-form  
+   `out_re = re*cos - im*sin`, `out_im = im*cos + re*sin` matches HF on the **same** cos/sin.
+3. Predeclared:
+   - cos/sin tensors differ → freq construction or cast of angle;
+   - cos/sin match, outputs differ → rotate pairing / multiply order / dtype of intermediates;
+   - both match for layer-0 position 76 but full-seq dump still diverges → layout/indexing bug in dump only (unlikely given inject success).
 
-That is the shortest path from "narrowed" to "positive root cause."
+Only after that one-line diagnosis should `src/hephaestus/kernels.mojo` be patched (separate decision; this investigation still does not modify engine code).
 
 ## Artifact map
 
@@ -185,3 +221,4 @@ See `experiments/spike/README.md`. Compact committed evidence in `experiments/sp
 | 10 | HF eager vs SDPA vs Hephaestus | `out/probe10_hf_variants.json` |
 | 11 | layer-0 Q/K/V seed localization | `out/probe11_layer0_seed.json`, `out/probe11_qkv_hfrope.json` |
 | 12 | FP8 widening / margin bar | `out/probe12_fp8_margin.json` |
+| **13** | **Q cut-points + replace-and-continue** | **`out/probe13_q_cuts.json`** |

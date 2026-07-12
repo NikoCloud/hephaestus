@@ -31,6 +31,7 @@ Focused evidence for prompt 1, teacher-forced step 67, token 96874.
 | 10 | direct HF eager/SDPA/Hephaestus exact-prefix comparison | `sh experiments/spike/run_py_gpu.sh experiments/spike/probe10_hf_variants.py` |
 | 11 | layer-0 Q/K/V seed localization | build `probe11_dump_l0.mojo` then `run_py_gpu.sh probe11_layer0_seed.py`; HF-rope compare writes `out/probe11_qkv_hfrope.json` |
 | 12 | FP8 widening bar on measured delta | `python3 experiments/spike/probe12_fp8_margin.py` (needs `/tmp` logit artifacts) |
+| 13 | Q cut-points + replace-and-continue | `sh experiments/spike/run_probe13.sh` → `out/probe13_q_cuts.json` |
 
 `spike_forward.mojo` adds snapshots to the production operation order. `spike_kernels.mojo` copies production attention and parameterizes only probability/score rounding for probe 9. Its production control must reproduce target value `16.312086` exactly.
 
@@ -45,6 +46,7 @@ Focused evidence for prompt 1, teacher-forced step 67, token 96874.
 - `out/probe11_layer0_seed.json`
 - `out/probe11_qkv_hfrope.json`
 - `out/probe12_fp8_margin.json`
+- `out/probe13_q_cuts.json`
 - `out/p1_prompt.txt`, `out/p1_oracle.txt`
 
 Generated `.npy` matrices and caches are reproducible intermediates and are not repository artifacts.

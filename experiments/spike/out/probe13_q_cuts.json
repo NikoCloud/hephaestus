@@ -1,0 +1,110 @@
+{
+  "input": {
+    "seq_len": 77,
+    "target_row": 76,
+    "step": 67,
+    "token": 96874
+  },
+  "predictions": {
+    "error_appears_at_q_proj": false,
+    "error_appears_at_q_norm": false,
+    "error_appears_at_rope": true,
+    "inject_q_proj_collapses": false,
+    "inject_q_norm_collapses": false,
+    "inject_q_rope_collapses": true
+  },
+  "heph_vs_hf_sdpa": {
+    "q_proj": {
+      "all_rel": 9.880118420920104e-05,
+      "all_max_abs": 0.001953125,
+      "tgt_rel": 1.887274196175319e-05,
+      "tgt_max_abs": 0.0001220703125,
+      "hf_ref": "sdpa"
+    },
+    "q_norm": {
+      "all_rel": 0.00010474586568987531,
+      "all_max_abs": 0.03125,
+      "tgt_rel": 2.18175490074482e-05,
+      "tgt_max_abs": 0.001953125,
+      "hf_ref": "sdpa"
+    },
+    "q_rope": {
+      "all_rel": 0.0016393251819126638,
+      "all_max_abs": 0.0625,
+      "tgt_rel": 0.0015874905542509455,
+      "tgt_max_abs": 0.03125,
+      "hf_ref": "sdpa"
+    }
+  },
+  "cut_rel_sequence": [
+    [
+      "q_proj",
+      9.880118420920104e-05
+    ],
+    [
+      "q_norm",
+      0.00010474586568987531
+    ],
+    [
+      "q_rope",
+      0.0016393251819126638
+    ]
+  ],
+  "first_elevated_cut": "q_rope",
+  "growth": {
+    "q_norm_over_q_proj": 1.0601681197270574,
+    "q_rope_over_q_norm": 15.650500104379015
+  },
+  "interventions": {
+    "control": {
+      "hidden_rel_vs_hf": 0.3345107048505526,
+      "hidden_max_abs_vs_hf": 22.0,
+      "logit_target": 16.31208610534668,
+      "logit_target_hf": 4.25,
+      "abs_diff_target": 12.06208610534668,
+      "argmax": 15678,
+      "argmax_hf": 15678,
+      "argmax_match_hf": true,
+      "collapse_ratio": 1.0,
+      "collapsed": false
+    },
+    "inject_q_proj": {
+      "hidden_rel_vs_hf": 0.11990812117343204,
+      "hidden_max_abs_vs_hf": 8.0,
+      "logit_target": 6.362671852111816,
+      "logit_target_hf": 4.25,
+      "abs_diff_target": 2.1126718521118164,
+      "argmax": 15678,
+      "argmax_hf": 15678,
+      "argmax_match_hf": true,
+      "collapse_ratio": 0.35845824792663267,
+      "collapsed": false
+    },
+    "inject_q_norm": {
+      "hidden_rel_vs_hf": 0.11990812117343204,
+      "hidden_max_abs_vs_hf": 8.0,
+      "logit_target": 6.362671852111816,
+      "logit_target_hf": 4.25,
+      "abs_diff_target": 2.1126718521118164,
+      "argmax": 15678,
+      "argmax_hf": 15678,
+      "argmax_match_hf": true,
+      "collapse_ratio": 0.35845824792663267,
+      "collapsed": false
+    },
+    "inject_q_rope": {
+      "hidden_rel_vs_hf": 0.0381827016755236,
+      "hidden_max_abs_vs_hf": 2.0,
+      "logit_target": 4.054419040679932,
+      "logit_target_hf": 4.25,
+      "abs_diff_target": 0.19558095932006836,
+      "argmax": 15678,
+      "argmax_hf": 15678,
+      "argmax_match_hf": true,
+      "collapse_ratio": 0.1141449320510752,
+      "collapsed": true
+    }
+  },
+  "control_hidden_rel": 0.3345107048505526,
+  "causal_verdict": "cut rels: q_proj=9.88012e-05, q_norm=0.000104746, q_rope=0.00163933 | control: hidden_rel=0.33451 collapse_ratio=1.0 logit96874=16.3121 | inject_q_proj: hidden_rel=0.11991 collapse_ratio=0.35845824792663267 logit96874=6.3627 | inject_q_norm: hidden_rel=0.11991 collapse_ratio=0.35845824792663267 logit96874=6.3627 | inject_q_rope: hidden_rel=0.03818 collapse_ratio=0.1141449320510752 logit96874=4.0544 | INTERPRETATION: earliest collapsing inject is inject_q_rope \u2014 seed is at or before that cut; later-only collapse would mean downstream of earlier cuts."
+}
