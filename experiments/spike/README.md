@@ -48,6 +48,7 @@ Focused evidence for prompt 1, teacher-forced step 67, token 96874.
 - `out/probe11_qkv_hfrope.json`
 - `out/probe12_fp8_margin.json`
 - `out/probe13_q_cuts.json`
+- `out/probe14_rope_substep.json`
 - `out/p1_prompt.txt`, `out/p1_oracle.txt`
 
 Generated `.npy` matrices and caches are reproducible intermediates and are not repository artifacts.

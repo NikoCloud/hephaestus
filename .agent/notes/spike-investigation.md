@@ -90,7 +90,10 @@ Future-token leakage and row misalignment are **ruled out**. Cached vs one-shot 
 | Hephaestus inside a defensible BF16 ensemble | measured independent impls bracket Hephaestus | HF eager−SDPA hidden spread at row 67: **0.046**; Heph−SDPA: **0.335** | **NOT ESTABLISHED** at final hidden (seed is normal-sized; amplification is not) |
 | Seed is `q_proj` matmul | cut error large at post-`q_proj`; inject collapses | cut rel **9.88e-5**; inject ratio 0.36 (not collapsed) | **RULED OUT as primary** |
 | Seed is `q_norm` | cut error jumps at post-`q_norm`; inject collapses | cut rel **1.05e-4** (×1.06 vs proj); inject **identical** to `q_proj` inject | **RULED OUT as primary** |
-| Seed is RoPE on Q | cut error jumps at post-RoPE; inject collapses final spike | cut rel **1.64e-3** (**×15.7**); inject hidden ratio **0.114**, logit gap 12.06→**0.20** | **SUPPORTED — positive causal evidence** |
+| Seed is RoPE on Q | cut error jumps at post-RoPE; inject collapses final spike | cut rel **1.64e-3** (**×15.7**); inject hidden ratio **0.114**, logit gap 12.06→**0.20** | **SUPPORTED** |
+| cos/sin / inv_freq construction wrong | heph cos/sin differ from HF enough to explain dump gap | cos **bit-identical**; sin 1 pair ×1 ulp; inv_freq rel 1e-16 | **RULED OUT** |
+| Wrong rotate pairing / sign | interleaved or conjugate matches heph dump | interleaved/conjugate rel ~0.85–0.99 vs dump | **RULED OUT** |
+| f32-accum rotate vs HF bf16 stepwise | f32-accum gap matches dump; strict bf16 matches HF | f32-accum vs HF **1.91e-3** ≈ dump **1.64e-3**; strict bf16 **2.07e-5** | **ROOT CAUSE** |
 | Benign under FP8 widening | no clear argmax flips when error is coarsened to E4M3-class | probe 8: 3 / 6 clear flips; probe 12: **81 non-tie** rows with `s_flip ≤ 16`; spike row `s_flip ≈ 2.18` | **BENIGN REJECTED** |
 
 ### Hidden-state / projection evidence
@@ -193,19 +196,46 @@ Predeclared collapse rule: final hidden rel < 25% of control (control = 0.3345).
 
 Evidence: `experiments/spike/out/probe13_q_cuts.json`, `probe13_q_cuts.mojo`, `probe13_hf_q_cuts.py`, `run_probe13.sh`.
 
-## Narrowest next discriminating probe
+## Probe 14 — RoPE sub-step isolation (2026-07-12)
 
-Inside `rope_kernel` / HF `apply_rotary_pos_emb`, isolate which sub-step diverges:
+**ROOT CAUSE:** `rope_kernel` applies the rotate as an **f32-accumulated**  
+`(re*cos)−(im*sin)` / `(im*cos)+(re*sin)` after casting cos/sin to bf16.  
+HF applies **stepwise bf16** `(q*cos)+(rotate_half(q)*sin)` (mul then add, both in bf16).  
+Algebraically identical in f64; **not** identical under bf16 rounding. The f32 path is more accurate and therefore diverges from the reference.
 
-1. Dump per-pair `cos`/`sin` (bf16) for positions 0…76 and pair indices 0…63 from both sides.
-2. Dump one head's pre-RoPE Q and post-RoPE Q elementwise; check whether the closed-form  
-   `out_re = re*cos - im*sin`, `out_im = im*cos + re*sin` matches HF on the **same** cos/sin.
-3. Predeclared:
-   - cos/sin tensors differ → freq construction or cast of angle;
-   - cos/sin match, outputs differ → rotate pairing / multiply order / dtype of intermediates;
-   - both match for layer-0 position 76 but full-seq dump still diverges → layout/indexing bug in dump only (unlikely given inject success).
+| test | result |
+|---|---|
+| cos heph vs hf | **bit-identical** |
+| sin heph vs hf | 1/4928 pairs differ by 1 ulp (negligible) |
+| inv_freq max_rel | **1.7e-16** |
+| closed form ≡ rotate_half (f64) | **max abs 0** |
+| HF stepwise bf16 on hf_pre → hf_post | rel **2.07e-5** (self-check) |
+| strict bf16 closed form → hf_post | rel **2.07e-5** (matches HF) |
+| **f32-accum closed form → hf_post** | rel **1.91e-3** |
+| Hephaestus dump → hf_post | rel **1.64e-3** (ratio dump/model **0.86**) |
+| HF rope on heph_pre → hf_post | rel **1.07e-4** (pre-rope noise only) |
+| interleaved / wrong-sign / conjugate | rel ~0.85–0.99 — **not** the dump |
 
-Only after that one-line diagnosis should `src/hephaestus/kernels.mojo` be patched (separate decision; this investigation still does not modify engine code).
+Element view (target row): q_rope mean abs 0.00049, max 0.03125; **not** concentrated on highest-freq pair 0 (mean 0.00033) — consistent with systematic rounding-mode difference, not a trig-domain failure.
+
+**Engine locus:** `src/hephaestus/kernels.mojo` `rope_kernel` ~L142–143:
+
+```mojo
+x[base + i_re] = (re * cos_v) - (im * sin_v)   # f32 accum, one store cast
+x[base + i_im] = (im * cos_v) + (re * sin_v)
+```
+
+**Proposed fix (NOT applied — separate decision):** force bf16 after each mul and after add/sub, e.g. match HF's stepwise rounding, or write the rotate_half form with bf16 casts. Then re-run teacher-forced / probe 13 inject control as regression.
+
+Evidence: `out/probe14_rope_substep.json`, `probe14_rope_substep.py`, `probe14_roped_element_analysis.py`.  
+Causal chain: probe 13 inject proves RoPE Q is sufficient; probe 14 proves **which arithmetic** inside RoPE.
+
+## Next step (fix — out of investigation scope)
+
+One deliberate patch to `rope_kernel`, then re-measure:
+- target logit[96874] should move from 16.31 toward 4.25
+- full-vocab max_abs_diff and 768-step non-tie flips
+- only then reconsider Phase 1b entry / FP8 bar
 
 ## Artifact map
 
@@ -223,4 +253,5 @@ See `experiments/spike/README.md`. Compact committed evidence in `experiments/sp
 | 10 | HF eager vs SDPA vs Hephaestus | `out/probe10_hf_variants.json` |
 | 11 | layer-0 Q/K/V seed localization | `out/probe11_layer0_seed.json`, `out/probe11_qkv_hfrope.json` |
 | 12 | FP8 widening / margin bar | `out/probe12_fp8_margin.json` |
-| **13** | **Q cut-points + replace-and-continue** | **`out/probe13_q_cuts.json`** |
+| 13 | Q cut-points + replace-and-continue | `out/probe13_q_cuts.json` |
+| **14** | **RoPE sub-step → root cause** | **`out/probe14_rope_substep.json`** |
