@@ -75,6 +75,17 @@ def main():
         print(f"No safetensors files found in {model_dir}")
         sys.exit(1)
     
+    # Tied embeddings: 4B checkpoint omits lm_head.weight; tiny_random saves it
+    # anyway. Drop it so the Mojo loader sees a uniform tensor set, but only
+    # after proving it is byte-identical to embed_tokens (i.e. actually tied).
+    by_name = {name: data for name, _, _, data in all_entries}
+    if "lm_head.weight" in by_name:
+        if by_name["lm_head.weight"] != by_name["model.embed_tokens.weight"]:
+            print("FATAL: lm_head.weight present but differs from embed_tokens.weight")
+            sys.exit(1)
+        all_entries = [e for e in all_entries if e[0] != "lm_head.weight"]
+        print("Dropped lm_head.weight (byte-identical to embed_tokens, tied)")
+
     # Write flat binary blob + offsets
     current_offset = 0
     with open(weights_path, "wb") as wf, open(offsets_path, "w") as of:
