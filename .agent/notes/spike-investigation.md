@@ -25,16 +25,16 @@ Re-verified from the five on-disk `/tmp/spike-det-1783875368/rep{1..5}_logits.f3
 
 ## Verdict
 
-**RoPE f32-accum root cause (probe 14) is fixed and verified at the cut-point. The 12-unit spike does NOT clear — remaining seed is layer-0 `q_proj` (matmul). FP8 bar still fails. Do not clear Phase 1b entry.**
+**RoPE fixed (probe 14). Remaining spike is NOT a gemv/bf16-accum bug (probe 15). Heph `q_proj` is bit-exact sequential f32-accum of identical `xn`; HF differs in 110 ULPs; those 110 alone flip logit 16.38→4.71. FP8 bar still fails. Do not clear Phase 1b entry.**
 
 What is established:
 
-1. Deterministic, row-wide, upstream of LM head; amplified on ill-conditioned rows.
-2. **Probe 14:** `rope_kernel` f32-accumulated rotate vs HF stepwise bf16 — **confirmed and patched** (see “Verified fix” below).
-3. **Post-fix cut-points:** post-RoPE Q rel vs HF drops **1.64e-3 → 1.07e-4** (now ≈ pre-rope noise). RoPE is no longer the elevated cut.
-4. **Post-fix spike (probe 13 control):** logit[96874] still **16.38** (abs diff **12.13** vs HF 4.25) — **not** the hoped-for ~0.20.
-5. **Post-fix inject re-ablation** (with fixed rope): `inject_q_proj` / `inject_q_norm` now **collapse** (logit → **4.71**, abs ~0.46; hidden rel ~0.046). So the remaining causal seed is **`q_proj` matmul**, not RoPE. Pre-fix, broken rope re-corrupted injected pre-rope Q, masking this.
-6. **Probe 12 post-fix:** non-tie `s_flip≤16` rows **81 → 74** (slight); target `s_flip` still ~2.16. **Benign still rejected.**
+1. Deterministic, row-wide, upstream of LM head; ill-conditioned amplification.
+2. **RoPE** f32-accum vs HF bf16 stepwise — **fixed and cut-verified**.
+3. **Spike remains** post-RoPE-fix (logit[96874] **16.38**, abs **12.13**).
+4. **Probe 15:** prefill uses **`matmul_kernel_naive` (m=77), not gemv**. `xn` bit-identical. Heph `q_proj` **≡** sequential f32-accum. HF differs in **110/315392** elements. Hybrid inject of only those 110 → collapses spike. **Force-bf16-accum RULED OUT** (rel 0.13 vs both dumps).
+5. Remaining match-to-HF problem is **torch vs sequential f32 reduction/blocking ULPs**, not “too accurate f32 accum.”
+6. **FP8 bar still fails** (probe 12 post-fix: 74 non-tie unsafe rows).
 
 ## Corrected anomaly shape
 
