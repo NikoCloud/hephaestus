@@ -69,7 +69,7 @@ Scope (exhaustive — if it's not listed, it's not in):
 
 **Exit gate (all must pass):**
 - [x] **G1a-1: PASS** (2026-07-12) — correctness vs HF Qwen3-4B-Instruct-2507, restated as a three-part checkable gate (below); measured in `bench/1a.md`
-- [ ] G1a-2: ≥ **90%** of llama.cpp single-stream decode tok/s, same model converted to **F16 GGUF** via `convert_hf_to_gguf.py` (we make the F16 GGUF ourselves), same card, ≥3 runs each
+- [ ] G1a-2: ≥ **90%** of llama.cpp single-stream decode tok/s, same model converted to **F16 GGUF** via `convert_hf_to_gguf.py` (we make the F16 GGUF ourselves), same card, ≥3 runs each — **99.0%** measured (49.13 / 49.63 tok/s), not yet PASS; `bench/1a.md`
 - [x] **G1a-3: PASS** (2026-07-12) — loads in ~6.3s warm, ≤~8.5s cold bound; measured in `bench/1a.md`
 - Benchmark log committed to repo (`bench/1a.md`)
 

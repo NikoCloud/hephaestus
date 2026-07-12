@@ -18,6 +18,7 @@ from std.math import ceildiv, cos, exp, sin, sqrt
 from std.memory import stack_allocation
 
 from std.gpu.host import DeviceContext
+from std.utils.index import IndexList
 from layout import Coord, TileTensor
 from layout.tile_layout import row_major
 from linalg.gemv import gemv_gpu
@@ -72,6 +73,70 @@ def linear(
     ]
     ctx.enqueue_function[kernel](
         c,
+        a,
+        b,
+        m,
+        n,
+        k,
+        grid_dim=(ceildiv(m, BLOCK_DIM), ceildiv(n, BLOCK_DIM)),
+        block_dim=(BLOCK_DIM, BLOCK_DIM),
+    )
+
+
+def linear_add_residual(
+    residual: TileTensor[mut=True, BF16, ...],
+    a: TileTensor[BF16, ...],
+    b: TileTensor[BF16, ...],
+    m: Int,
+    n: Int,
+    k: Int,
+    ctx: DeviceContext,
+) raises:
+    """residual += A @ B^T, fused via the matmul kernels' elementwise epilogue
+    (G1a-2: removes a separate residual_add launch -- used for o_proj and
+    down_proj, the two projections immediately followed by a residual add).
+
+    Every elementwise_lambda_fn call site in gemv.mojo and matmul_kernel_naive
+    invokes the epilogue with width=1 (one element at a time, no
+    vectorization in these paths) -- verified by reading every call site
+    before relying on it here.
+    """
+
+    @always_inline
+    @__copy_capture(residual)
+    @parameter
+    def epilogue[
+        dtype: DType, width: SIMDSize, *, alignment: Int = 1
+    ](idx: IndexList[2], val: SIMD[dtype, width]) -> None:
+        var off = residual.layout(Coord(idx))
+        var old = residual.raw_load[width=width](off).cast[F32]()
+        residual.raw_store[width=width, alignment=alignment](
+            off, (old + val.cast[F32]()).cast[BF16]()
+        )
+
+    if m == 1:
+        gemv_gpu[transpose_b=True, elementwise_lambda_fn=epilogue](
+            residual, a, b, ctx
+        )
+        return
+
+    comptime BLOCK_DIM = 16
+    comptime kernel = matmul_kernel_naive[
+        BF16,
+        BF16,
+        BF16,
+        type_of(residual).LayoutType,
+        type_of(a).LayoutType,
+        type_of(b).LayoutType,
+        BLOCK_DIM,
+        True,  # transpose_b
+        elementwise_lambda_fn=epilogue,
+        c_storage = type_of(residual).Storage,
+        a_storage = type_of(a).Storage,
+        b_storage = type_of(b).Storage,
+    ]
+    ctx.enqueue_function[kernel](
+        residual,
         a,
         b,
         m,
@@ -141,6 +206,83 @@ def rope_kernel[
     #              out[i+d/2] = q[i+d/2]*cos + q[i]*sin
     x[base + i_re] = (re * cos_v) - (im * sin_v)
     x[base + i_im] = (im * cos_v) + (re * sin_v)
+
+
+def rope_kernel_qk[
+    head_dim: Int, theta: Float64
+](
+    q_ptr: UnsafePointer[Scalar[BF16], MutAnyOrigin],
+    k_ptr: UnsafePointer[Scalar[BF16], MutAnyOrigin],
+    n_heads: Int,
+    n_kv_heads: Int,
+    seq: Int,
+    pos_offset: Int,
+):
+    """Q and K RoPE in one launch (G1a-2: one fewer kernel per layer). Same
+    per-element math as rope_kernel; only the source array is picked by
+    which half of the combined index range this thread falls in."""
+    var half = head_dim // 2
+    var gid = Int(block_idx.x * block_dim.x + thread_idx.x)
+    var total_q = seq * n_heads * half
+
+    var x: UnsafePointer[Scalar[BF16], MutAnyOrigin]
+    var n: Int
+    var local_gid: Int
+    if gid < total_q:
+        x = q_ptr
+        n = n_heads
+        local_gid = gid
+    else:
+        var total_k = seq * n_kv_heads * half
+        if gid >= total_q + total_k:
+            return
+        x = k_ptr
+        n = n_kv_heads
+        local_gid = gid - total_q
+
+    var pair = local_gid % half
+    var rest = local_gid // half
+    var head = rest % n
+    var tok = rest // n
+
+    var i_re = pair
+    var i_im = pair + half
+    var base = (tok * n + head) * head_dim
+    var pos = Float64(tok + pos_offset)
+    var freq = Float32(pos * (theta ** (-2.0 * Float64(pair) / Float64(head_dim))))
+    var cos_v = cos(freq).cast[BF16]()
+    var sin_v = sin(freq).cast[BF16]()
+
+    var re = x[base + i_re]
+    var im = x[base + i_im]
+    x[base + i_re] = (re * cos_v) - (im * sin_v)
+    x[base + i_im] = (im * cos_v) + (re * sin_v)
+
+
+def apply_rope_qk_inplace[
+    head_dim: Int, theta: Float64
+](
+    q_ptr: UnsafePointer[Scalar[BF16], MutAnyOrigin],
+    k_ptr: UnsafePointer[Scalar[BF16], MutAnyOrigin],
+    n_heads: Int,
+    n_kv_heads: Int,
+    seq: Int,
+    pos_offset: Int,
+    ctx: DeviceContext,
+) raises:
+    comptime TPB = 256
+    var half = head_dim // 2
+    var total = seq * (n_heads + n_kv_heads) * half
+    ctx.enqueue_function[rope_kernel_qk[head_dim, theta]](
+        q_ptr,
+        k_ptr,
+        n_heads,
+        n_kv_heads,
+        seq,
+        pos_offset,
+        grid_dim=(ceildiv(total, TPB),),
+        block_dim=(TPB,),
+    )
 
 
 def apply_rope_inplace[
