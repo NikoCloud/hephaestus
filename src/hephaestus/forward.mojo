@@ -22,6 +22,7 @@ from nn.gather_scatter import gather
 from nn.normalization import rms_norm_gpu
 
 from hephaestus.kernels import (
+    F32,
     apply_rope_inplace,
     attention,
     cache_write,
@@ -90,7 +91,7 @@ struct Activations[
     var gate: DeviceBuffer[BF16]  # [seq, inter]
     var up: DeviceBuffer[BF16]  # [seq, inter]
     var act: DeviceBuffer[BF16]  # [seq, inter] silu(gate)*up
-    var logits: DeviceBuffer[BF16]  # [seq, vocab]
+    var logits: DeviceBuffer[F32]  # [seq, vocab] -- fp32, never bf16
     var max_seq: Int
 
     def __init__(out self, ctx: DeviceContext, max_seq: Int) raises:
@@ -104,7 +105,7 @@ struct Activations[
         self.gate = ctx.enqueue_create_buffer[BF16](max_seq * Self.inter)
         self.up = ctx.enqueue_create_buffer[BF16](max_seq * Self.inter)
         self.act = ctx.enqueue_create_buffer[BF16](max_seq * Self.inter)
-        self.logits = ctx.enqueue_create_buffer[BF16](max_seq * Self.vocab)
+        self.logits = ctx.enqueue_create_buffer[F32](max_seq * Self.vocab)
         self.max_seq = max_seq
 
 

@@ -107,10 +107,11 @@ def main() raises:
         var base = (seq - 1) * VOCAB
         var buf = List[Float32]()
         for i in range(VOCAB):
-            var val = h[base + i].cast[DType.float32]()
+            var val = h[base + i]
             buf.append(val)
-            if val > best_val:
-                best_val = val
+            var rounded = val.cast[DType.bfloat16]().cast[DType.float32]()
+            if rounded > best_val:
+                best_val = rounded
                 best = i
         f.write_bytes(
             Span[Byte, origin_of(buf)](

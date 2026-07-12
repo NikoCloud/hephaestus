@@ -1,0 +1,10 @@
+{
+  "model": "Qwen3-4B-Instruct-2507",
+  "attn_implementation": "eager",
+  "torch_version": "2.9.1+rocm6.3",
+  "transformers_version": "5.13.1",
+  "dtype": "bfloat16",
+  "generation": "greedy, no sampling, no EOS early-stop",
+  "num_new_tokens": 256,
+  "note": "Reference with fully-specified attention arithmetic; see script docstring."
+}

@@ -34,7 +34,7 @@ comptime F32 = DType.float32
 
 
 def linear(
-    c: TileTensor[mut=True, BF16, ...],
+    c: TileTensor[mut=True, ...],
     a: TileTensor[BF16, ...],
     b: TileTensor[BF16, ...],
     m: Int,
@@ -42,9 +42,12 @@ def linear(
     k: Int,
     ctx: DeviceContext,
 ) raises:
+    """C = A @ B^T. c may be BF16 (activations) or F32 (logits: the LM head
+    output must NOT be rounded to BF16 -- a one-ulp gap between the top two
+    tokens is decidable in fp32 and a coin-flip tie in bf16)."""
     comptime BLOCK_DIM = 16
     comptime kernel = matmul_kernel_naive[
-        BF16,
+        type_of(c).dtype,
         BF16,
         BF16,
         type_of(c).LayoutType,
@@ -111,15 +114,22 @@ def rope_kernel[
 
     var base = (tok * n_heads + head) * head_dim
     var pos = Float64(tok + pos_offset)
-    # inv_freq for the pair: theta ^ (-2*pair/head_dim)
+    # HF computes freqs and cos/sin in fp32 (autocast forced off)...
     var freq = Float32(pos * (theta ** (-2.0 * Float64(pair) / Float64(head_dim))))
-    var cos_v = cos(freq)
-    var sin_v = sin(freq)
+    # ...but then returns `cos.to(dtype=x.dtype)`, so cos/sin are BF16 and
+    # apply_rotary_pos_emb runs `(q*cos) + (rotate_half(q)*sin)` entirely in
+    # bf16, rounding after every op. Doing this in fp32 is MORE accurate and
+    # therefore wrong: it drifts from the reference we must match token-for-
+    # token. Round exactly where torch rounds.
+    var cos_v = cos(freq).cast[BF16]()
+    var sin_v = sin(freq).cast[BF16]()
 
-    var re = x[base + i_re].cast[F32]()
-    var im = x[base + i_im].cast[F32]()
-    x[base + i_re] = (re * cos_v - im * sin_v).cast[BF16]()
-    x[base + i_im] = (re * sin_v + im * cos_v).cast[BF16]()
+    var re = x[base + i_re]
+    var im = x[base + i_im]
+    # rotate_half: out[i]     = q[i]*cos     - q[i+d/2]*sin
+    #              out[i+d/2] = q[i+d/2]*cos + q[i]*sin
+    x[base + i_re] = (re * cos_v) - (im * sin_v)
+    x[base + i_im] = (im * cos_v) + (re * sin_v)
 
 
 def apply_rope_inplace[
@@ -213,6 +223,11 @@ def attention_kernel[
             partial += shuffle_down(partial, UInt32(off))
             off //= 2
         if lane == 0:
+            # Scores stay in fp32 through the scale. Rounding them to bf16 here
+            # (matching eager's `matmul(q,k^T) * scaling` literally) was MEASURED
+            # worse -- prompt2 divergence moved 12 -> 6 against both references.
+            # The reference's effective precision is higher than its Python
+            # source suggests; do not "match" it past what the evidence supports.
             scores[j] = partial * scale
         j += 1
     barrier()
@@ -229,7 +244,13 @@ def attention_kernel[
             s += e
         var inv = Float32(1.0) / s
         for jj in range(n_keys):
-            scores[jj] = scores[jj] * inv
+            # HF: softmax(..., dtype=float32).to(query.dtype) -- the probs are
+            # ROUNDED TO BF16 before the PV product. Keeping fp32 here is more
+            # accurate but diverges from the reference, and token-exactness is
+            # the gate, not accuracy.
+            scores[jj] = (
+                (scores[jj] * inv).cast[BF16]().cast[F32]()
+            )
     barrier()
 
     # --- out = sum_j p_j * v_j ---------------------------------------------
@@ -290,7 +311,8 @@ def silu_mul_kernel(
     if i >= n:
         return
     var g = gate_ptr[i].cast[F32]()
-    var silu = g / (Float32(1.0) + exp(-g))
+    # HF: act_fn(gate_proj(x)) is a bf16 tensor before being multiplied by up.
+    var silu = (g / (Float32(1.0) + exp(-g))).cast[BF16]().cast[F32]()
     out_ptr[i] = (silu * up_ptr[i].cast[F32]()).cast[BF16]()
 
 

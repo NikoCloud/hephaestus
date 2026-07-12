@@ -104,7 +104,11 @@ def generate(
         with acts.logits.map_to_host() as h:
             var base = (n - 1) * VOCAB
             for i in range(VOCAB):
-                var val = h[base + i].cast[DType.float32]()
+                # Greedy = argmax over the REFERENCE's logit dtype. HF's lm_head
+                # emits bf16, and torch.argmax returns the FIRST max, so ties
+                # break to the lower id. Comparing in fp32 resolves ties torch
+                # never saw and picks differently (prompt3 step7). Round first.
+                var val = h[base + i].cast[DType.bfloat16]().cast[DType.float32]()
                 if val > best_val:
                     best_val = val
                     best = Int32(i)
