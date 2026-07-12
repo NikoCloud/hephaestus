@@ -23,3 +23,5 @@
 | 2026-07-12 | Model dims are comptime struct params, not hard-coded 4B constants | tiny_random debug loop (mandated) needs different dims; compile-time parameterization, zero runtime config-driven generality; 4B stays the only shipped instantiation | Yes |
 | 2026-07-12 | Loader verifies device copy by round-trip compare (full <=16MB, sampled above) | GPU copies fail silently (project has already seen an all-zeros kernel); ~1s overhead on 8GB load, still 6.3s total | Yes |
 | 2026-07-12 | G1a-3 PASS: 4B loads in ~6.3s warm, <=8.5s cold bound | 3 reps in bench/1a-load.md; NVMe direct read 4.3 GB/s bounds the cold case | No |
+| 2026-07-12 | A12 (metadata format == "pt") enforced in stager, not Mojo loader | staging strips safetensors headers; the stager is the only place the header is visible; verified passing on tiny + 4B | Yes |
+| 2026-07-12 | Tiny oracle extended with step logits from EXISTING weights (scripts/build_tiny_logits.py) | tiny had token IDs only; logit-level diffing needs logits; every step token-verified vs reference_outputs.json so transformers drift fails loudly instead of poisoning fixtures | Yes |

@@ -20,7 +20,13 @@ import sys
 def read_safetensors_header(filepath):
     with open(filepath, "rb") as f:
         header_len = struct.unpack("<Q", f.read(8))[0]
-        return json.loads(f.read(header_len)), header_len
+        header = json.loads(f.read(header_len))
+    # A12: this is the only place the safetensors header is visible (the Mojo
+    # loader sees the staged blob, headers stripped), so enforce it here.
+    fmt = header.get("__metadata__", {}).get("format")
+    if fmt != "pt":
+        raise ValueError(f"A12: {filepath} metadata format is {fmt!r}, expected 'pt'")
+    return header, header_len
 
 def main():
     model_dir = sys.argv[1]
