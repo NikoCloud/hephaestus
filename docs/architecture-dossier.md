@@ -48,10 +48,10 @@ Embedding shape: `[151936, 2560]` — the LM head shares this weight matrix (no 
 | attention_bias | false | config.json (no bias terms on Q/K/V/O projections) |
 | attention_dropout | 0.0 | config.json |
 | **GQA group size** | **4** | Derived: 32 query heads ÷ 8 KV heads |
-| Q projection | `[2560, 32×128=4096]` | No bias |
-| K projection | `[2560, 8×128=1024]` | No bias |
-| V projection | `[2560, 8×128=1024]` | No bias |
-| O projection | `[4096, 2560]` | No bias (output, 4096 = 32 heads × 128 head_dim) |
+| Q projection | `[4096, 2560]` safetensors `[out=32x128, in=2560]` | No bias |
+| K projection | `[1024, 2560]` safetensors `[out=8x128, in=2560]` | No bias |
+| V projection | `[1024, 2560]` safetensors `[out=8x128, in=2560]` | No bias |
+| O projection | `[2560, 4096]` safetensors `[out=2560, in=32x128]` | No bias |
 | Scale factor | `1/sqrt(128)` ≈ 0.0884 | Standard 1/sqrt(head_dim) |
 
 > **⚠ Non-square projections:** Qwen3 decouples `head_dim` from `hidden_size / num_heads`. With hidden=2560, 32 heads, and head_dim=128, the Q projection output is `32×128=4096`, **not** `hidden_size=2560`. So `q_proj` is a non-square `2560→4096` matrix and `o_proj` comes back `4096→2560`. K/V projections are `2560→1024` (8×128). Do **not** assume projection output = hidden size — this is the classic autopilot trap that produces silent shape mismatches.
@@ -69,9 +69,9 @@ Qwen3 applies RMSNorm to Q and K per-head before attention:
 |---|---|---|
 | hidden_act | `silu` | config.json |
 | intermediate_size | 9728 | config.json |
-| Gate projection | `[2560, 9728]` | No bias |
-| Up projection | `[2560, 9728]` | No bias |
-| Down projection | `[9728, 2560]` | No bias |
+| Gate projection | `[9728, 2560]` safetensors `[intermediate, hidden]` | No bias |
+| Up projection | `[9728, 2560]` safetensors `[intermediate, hidden]` | No bias |
+| Down projection | `[2560, 9728]` safetensors `[hidden, intermediate]` | No bias |
 | FFN formula | `down(silu(gate(x)) * up(x))` | Standard SwiGLU |
 
 ### 3d. Layer Normalization
@@ -120,23 +120,27 @@ For Phase 1a, the CLI takes a raw prompt string (no chat template). The oracle f
 
 ## 6. Tensor Inventory (per layer, BF16)
 
-| Tensor Name | Shape | Count | Notes |
-|---|---|---|---|
-| token_embd.weight | [151936, 2560] | 1 | Shared with output |
-| blk.{0-35}.attn_norm.weight | [2560] | 36 | RMSNorm gamma |
-| blk.{0-35}.attn_q.weight | [2560, 4096] | 36 | Q projection |
-| blk.{0-35}.attn_k.weight | [2560, 1024] | 36 | K projection |
-| blk.{0-35}.attn_v.weight | [2560, 1024] | 36 | V projection |
-| blk.{0-35}.attn_output.weight | [4096, 2560] | 36 | O projection |
-| blk.{0-35}.attn_q_norm.weight | [128] | 36 | Q per-head RMSNorm |
-| blk.{0-35}.attn_k_norm.weight | [128] | 36 | K per-head RMSNorm |
-| blk.{0-35}.ffn_norm.weight | [2560] | 36 | FFN RMSNorm gamma |
-| blk.{0-35}.ffn_gate.weight | [2560, 9728] | 36 | SwiGLU gate |
-| blk.{0-35}.ffn_down.weight | [9728, 2560] | 36 | SwiGLU down |
-| blk.{0-35}.ffn_up.weight | [2560, 9728] | 36 | SwiGLU up |
-| output_norm.weight | [2560] | 1 | Final RMSNorm |
+> **Convention note (verified 2026-07-11):** All shapes below are **safetensors order**, which follows PyTorch's `nn.Linear` convention: `weight = [out_features, in_features]`. GGUF reverses dimension order relative to PyTorch --- the original version of this table pulled GGUF-order shapes and was wrong. The safetensors header was read directly from `model-00001-of-00003.safetensors` and every shape below is sourced from that header, not inferred.
+>
+> **Key names** are also safetensors/HF format (`model.layers.N.self_attn.q_proj.weight`), not GGUF format (`blk.N.attn_q.weight`). The loader uses HF key names.
 
-**Total tensors:** 1 + 36×12 + 1 = **434 tensors** (but GGUF reported 398 — some may be fused/omitted; verify at load time)
+| Tensor Name (HF/safetensors) | Shape [out, in] | Count | Notes |
+|---|---|---|---|
+| model.embed_tokens.weight | [151936, 2560] | 1 | Shared with output (tied) |
+| model.layers.N.input_layernorm.weight | [2560] | 36 | RMSNorm gamma (pre-attention) |
+| model.layers.N.self_attn.q_proj.weight | [4096, 2560] | 36 | Q projection: [32x128, hidden] |
+| model.layers.N.self_attn.k_proj.weight | [1024, 2560] | 36 | K projection: [8x128, hidden] |
+| model.layers.N.self_attn.v_proj.weight | [1024, 2560] | 36 | V projection: [8x128, hidden] |
+| model.layers.N.self_attn.o_proj.weight | [2560, 4096] | 36 | O projection: [hidden, 32x128] |
+| model.layers.N.self_attn.q_norm.weight | [128] | 36 | Q per-head RMSNorm |
+| model.layers.N.self_attn.k_norm.weight | [128] | 36 | K per-head RMSNorm |
+| model.layers.N.post_attention_layernorm.weight | [2560] | 36 | RMSNorm gamma (pre-FFN) |
+| model.layers.N.mlp.gate_proj.weight | [9728, 2560] | 36 | SwiGLU gate: [intermediate, hidden] |
+| model.layers.N.mlp.up_proj.weight | [9728, 2560] | 36 | SwiGLU up: [intermediate, hidden] |
+| model.layers.N.mlp.down_proj.weight | [2560, 9728] | 36 | SwiGLU down: [hidden, intermediate] |
+| model.norm.weight | [2560] | 1 | Final RMSNorm |
+
+**Total tensors:** 1 + 36x11 + 1 = **398 tensors**. No `lm_head.weight` --- tied embeddings confirmed by absence.
 
 ## 7. Hard-Coded Constants Summary
 
@@ -161,9 +165,13 @@ comptime ATTENTION_BIAS = false
 comptime SCALE_FACTOR = 1.0 / sqrt(128.0)  // ~0.0884
 ```
 
-## 8. Weight Layout (safetensors)
+## 8. Weight Layout (safetensors) --- Verified 2026-07-11
 
 Safetensors stores BF16 tensors in row-major (C contiguous) layout.
-- Weight matrices are stored as `[in_features, out_features]` (PyTorch nn.Linear convention: weight is `[out, in]` but Qwen3 uses `[in, out]` in the checkpoint)
+- Weight matrices are stored as `[out_features, in_features]` --- **standard PyTorch `nn.Linear` convention**.
+- This was verified by reading the safetensors header directly from `model-00001-of-00003.safetensors`.
+- Example: `model.layers.0.self_attn.q_proj.weight` has shape `[4096, 2560]` = `[out=32x128, in=hidden]`.
 
-**Verify at load time:** The GGUF conversion logged shapes like `attn_q.weight [2560, 4096]` — this is `[hidden, num_heads * head_dim]`, meaning the weight is stored transposed from the typical PyTorch `[out_features, in_features]` convention. The safetensors checkpoint likely matches PyTorch's convention `[out_features, in_features]`, which would be `[4096, 2560]` for Q. **This must be verified when the safetensors loader is written.**
+> **Zero-copy loading:** The MAX matmul kernel `transpose_b=True` default expects B in `[N, K] = [out, in]` format --- which is exactly what safetensors provides. **No transposition needed at load time.** The bytes on disk are kernel-ready.
+
+> **Previous error (corrected):** The GGUF conversion logged shapes like `attn_q.weight [2560, 4096]` because GGUF reverses dimension order relative to PyTorch. The original section 6 table and section 8 used GGUF-order shapes. All shapes in this dossier are now safetensors-order, verified from the actual file header.
