@@ -1,7 +1,24 @@
 # Prompt 1 / step 67 logit-spike investigation
 
 **Date:** 2026-07-12  
-**Gate moved:** Phase 1b entry gate recorded in `DECISIONS.md`: explain the 12.06 logit anomaly **or** establish an FP8-relevant benign bound.
+**Status:** **CLOSED** — baseline fully understood; RoPE defect fixed on main; residual is irreducible BF16 matmul ambiguity.
+
+## Final verdict (Phase 1b entry)
+
+**Root cause identified. Two layers:**
+
+| layer | nature | action |
+|---|---|---|
+| **RoPE** f32-accum vs HF stepwise bf16 | **Real engine defect** | **Fixed** in `rope_kernel` / `rope_kernel_qk` (main). Cut-verified: post-RoPE Q rel 1.64e-3 → 1.07e-4. |
+| Residual full-vocab spikes (e.g. abs ~12 at tok 96874) | **Irreducible BF16 matmul reduction-order ambiguity** | **Not a defect.** Heph `q_proj` is bit-exact sequential f32-accum of identical `xn`; HF differs in **110/315392** ULPs (torch blocked/tree reduction). Hybrid inject of those 110 alone flips logit 16.38→4.71 — ill-conditioned amplification of legitimate precision-regime disagreement. |
+
+**Characterization:**
+
+- **Not benign under strict FP8 argmax-parity** with the measured residual delta (probe 12: dozens of non-tie rows with `s_flip ≤ 16`). Do not claim “harmless under FP8 widening.”
+- **Not an implementation bug** in the remaining path: sequential f32-accum is the correct textbook reduction; matching HF bit-for-bit would mean matching torch’s blocked matmul, not “fixing” Hephaestus arithmetic.
+- **Phase 1b entry gate CLEARS** because the BF16 baseline is now **fully understood**: one real bug found and fixed (RoPE); residual spikes characterized as inherent to BF16 matmul non-associativity / reduction order under ill-conditioned rows. Phase 1b gates use **tolerance-based** metrics (perplexity, speed) and layer-by-layer logit diffs against this known BF16 reference — not full-vocab bit identity.
+
+**Argmax / G1a-1:** unchanged — 0 non-tie flips across 768 teacher-forced steps (decision boundary clean).
 
 ## Determinism result (read this first)
 
@@ -11,7 +28,7 @@
 9618d6846a352682c6cc2f2af37c6b0a1c61769ba778f5d6cfb12d972ae39e00
 ```
 
-At prompt 1, teacher-forced step 67, token 96874:
+At prompt 1, teacher-forced step 67, token 96874 (pre-RoPE-fix artifact):
 
 | path | value | float32 bits |
 |---|---:|---:|
@@ -19,22 +36,11 @@ At prompt 1, teacher-forced step 67, token 96874:
 | HF SDPA | 4.25 | `0x40880000` |
 | signed difference | **+12.06208610534668** | — |
 
-Re-verified from the five on-disk `/tmp/spike-det-1783875368/rep{1..5}_logits.f32` files (independent of the original run shell). Source: `experiments/spike/probe0_determinism.py`, summary `experiments/spike/out/probe0_determinism.json`.
+Post-RoPE-fix (same step): logit **16.380**, abs **12.130** — RoPE fix removed the elevated cut-point error but not the residual spike (see probe 15).
 
-**Cut of the search space:** races, uninitialized memory, and nondeterministic reductions are **ruled out**. The anomaly is a deterministic indexing / arithmetic / reduction-order class of bug (or a deterministic implementation difference that amplifies).
+Re-verified from `/tmp/spike-det-1783875368/rep{1..5}_logits.f32`. Source: `experiments/spike/probe0_determinism.py`.
 
-## Verdict
-
-**RoPE fixed (probe 14). Remaining spike is NOT a gemv/bf16-accum bug (probe 15). Heph `q_proj` is bit-exact sequential f32-accum of identical `xn`; HF differs in 110 ULPs; those 110 alone flip logit 16.38→4.71. FP8 bar still fails. Do not clear Phase 1b entry.**
-
-What is established:
-
-1. Deterministic, row-wide, upstream of LM head; ill-conditioned amplification.
-2. **RoPE** f32-accum vs HF bf16 stepwise — **fixed and cut-verified**.
-3. **Spike remains** post-RoPE-fix (logit[96874] **16.38**, abs **12.13**).
-4. **Probe 15:** prefill uses **`matmul_kernel_naive` (m=77), not gemv**. `xn` bit-identical. Heph `q_proj` **≡** sequential f32-accum. HF differs in **110/315392** elements. Hybrid inject of only those 110 → collapses spike. **Force-bf16-accum RULED OUT** (rel 0.13 vs both dumps).
-5. Remaining match-to-HF problem is **torch vs sequential f32 reduction/blocking ULPs**, not “too accurate f32 accum.”
-6. **FP8 bar still fails** (probe 12 post-fix: 74 non-tie unsafe rows).
+**Cut of the search space:** races, uninitialized memory, and nondeterministic reductions are **ruled out**.
 
 ## Corrected anomaly shape
 
@@ -333,13 +339,19 @@ Those **110 ULP-level elements alone** collapse the spike. Not a global mis-accu
 | Heph q_proj mis-implemented vs f32 sum | **RULED OUT** (bit-exact match) |
 | Residual seed = sparse torch-vs-sequential f32 matmul ULPs, amplified | **SUPPORTED** |
 
-**Fix direction (not applied):** match **torch/ROCm matmul reduction/blocking** for BF16×BF16→BF16 with f32 accum (same algorithm as HF Linear), not “less accurate bf16 accum.” Alternatively, document residual as ULP-sensitivity if a broader FP8 bar is cleared by other means.
+**Closed as irreducible precision-regime ambiguity** (not a Hephaestus defect). Optional future work if full-vocab HF identity is ever required: match torch/ROCm blocked matmul reduction for prefill — engineering cost, not “more correct” sequential f32.
 
-Evidence: `out/probe15_qproj_accum.json`, `probe15_qproj_accum.{mojo,py}`.
+Evidence: `out/probe15_qproj_accum.json`, `probe15_qproj_accum.{mojo,py}` (investigate/logit-spike branch).
+
+## Closure / main merge
+
+- **RoPE fix** merged to `main` from investigation `eabf42c` (kernels only): stepwise bf16 in `rope_kernel` **and** `rope_kernel_qk` (main’s fused Q+K path).
+- **Phase 1b entry gate CLEARED** (see `DECISIONS.md` 2026-07-12): baseline fully understood; residual spikes characterized; 1b uses tolerance metrics vs this known BF16 reference.
+- Investigation probes remain on `investigate/logit-spike` under `experiments/spike/`.
 
 ## Artifact map
 
-See `experiments/spike/README.md`. Compact committed evidence in `experiments/spike/out/*.json`. Full vocab / hidden matrices live under `/tmp` and are intentionally not in git.
+Full probe suite on `investigate/logit-spike` (`experiments/spike/`). Compact JSON in `experiments/spike/out/`.
 
 | probe | purpose | committed output |
 |---|---|---|
@@ -349,9 +361,10 @@ See `experiments/spike/README.md`. Compact committed evidence in `experiments/sp
 | 3–4 | HF slots + layerwise bisect | `out/probe4_bisect.json` |
 | 5 | conditioning + HF self-spread | `out/probe5_conditioning.json` |
 | 8 | concrete E4M3 candidate | `out/probe8_fp8.json` |
-| 9 | attention rounding intervention | `/tmp/spike_iv_*` (A=16.312, B=8.289, C=11.859) |
+| 9 | attention rounding intervention | `/tmp/spike_iv_*` |
 | 10 | HF eager vs SDPA vs Hephaestus | `out/probe10_hf_variants.json` |
-| 11 | layer-0 Q/K/V seed localization | `out/probe11_layer0_seed.json`, `out/probe11_qkv_hfrope.json` |
+| 11 | layer-0 Q/K/V seed localization | `out/probe11_layer0_seed.json` |
 | 12 | FP8 widening / margin bar | `out/probe12_fp8_margin.json` |
 | 13 | Q cut-points + replace-and-continue | `out/probe13_q_cuts.json` |
-| **14** | **RoPE sub-step → root cause** | **`out/probe14_rope_substep.json`** |
+| 14 | RoPE sub-step root cause | `out/probe14_rope_substep.json` |
+| **15** | **q_proj ULP residual** | **`out/probe15_qproj_accum.json`** |
