@@ -20,6 +20,7 @@ from std.memory import stack_allocation
 from std.gpu.host import DeviceContext
 from layout import Coord, TileTensor
 from layout.tile_layout import row_major
+from linalg.gemv import gemv_gpu
 from linalg.matmul.gpu import matmul_kernel_naive
 
 comptime BF16 = DType.bfloat16
@@ -44,7 +45,17 @@ def linear(
 ) raises:
     """C = A @ B^T. c may be BF16 (activations) or F32 (logits: the LM head
     output must NOT be rounded to BF16 -- a one-ulp gap between the top two
-    tokens is decidable in fp32 and a coin-flip tie in bf16)."""
+    tokens is decidable in fp32 and a coin-flip tie in bf16).
+
+    Decode (m=1) routes to the vendored gemv_gpu (G1a-2): the naive kernel's
+    16x16 thread block wastes 15/16 of its threads on a single-row output.
+    No WMMA involved -- gemv_gpu is one of the two paths proven to compile
+    and be correct on gfx1201 (exp3e, DECISIONS.md 2026-07-12).
+    """
+    if m == 1:
+        gemv_gpu[transpose_b=True](c, a, b, ctx)
+        return
+
     comptime BLOCK_DIM = 16
     comptime kernel = matmul_kernel_naive[
         type_of(c).dtype,
