@@ -202,10 +202,17 @@ def rope_kernel[
 
     var re = x[base + i_re]
     var im = x[base + i_im]
-    # rotate_half: out[i]     = q[i]*cos     - q[i+d/2]*sin
-    #              out[i+d/2] = q[i+d/2]*cos + q[i]*sin
-    x[base + i_re] = (re * cos_v) - (im * sin_v)
-    x[base + i_im] = (im * cos_v) + (re * sin_v)
+    # HF: (q * cos) + (rotate_half(q) * sin) with bf16 after every mul and add.
+    # Mojo promotes BF16*BF16 to F32; a fused `(re*cos)-(im*sin)` then one store
+    # cast is f32-accum — more accurate than HF and was a real correctness bug
+    # (spike investigation probe 14, eabf42c). Round after each mul and after
+    # the add/sub to match torch.
+    var re_c = (re.cast[F32]() * cos_v.cast[F32]()).cast[BF16]()
+    var im_s = (im.cast[F32]() * sin_v.cast[F32]()).cast[BF16]()
+    var im_c = (im.cast[F32]() * cos_v.cast[F32]()).cast[BF16]()
+    var re_s = (re.cast[F32]() * sin_v.cast[F32]()).cast[BF16]()
+    x[base + i_re] = (re_c.cast[F32]() - im_s.cast[F32]()).cast[BF16]()
+    x[base + i_im] = (im_c.cast[F32]() + re_s.cast[F32]()).cast[BF16]()
 
 
 def rope_kernel_qk[
@@ -255,8 +262,13 @@ def rope_kernel_qk[
 
     var re = x[base + i_re]
     var im = x[base + i_im]
-    x[base + i_re] = (re * cos_v) - (im * sin_v)
-    x[base + i_im] = (im * cos_v) + (re * sin_v)
+    # Same stepwise bf16 as rope_kernel (must stay in lockstep).
+    var re_c = (re.cast[F32]() * cos_v.cast[F32]()).cast[BF16]()
+    var im_s = (im.cast[F32]() * sin_v.cast[F32]()).cast[BF16]()
+    var im_c = (im.cast[F32]() * cos_v.cast[F32]()).cast[BF16]()
+    var re_s = (re.cast[F32]() * sin_v.cast[F32]()).cast[BF16]()
+    x[base + i_re] = (re_c.cast[F32]() - im_s.cast[F32]()).cast[BF16]()
+    x[base + i_im] = (im_c.cast[F32]() + re_s.cast[F32]()).cast[BF16]()
 
 
 def apply_rope_qk_inplace[
