@@ -1,0 +1,11 @@
+{
+  "q_all_rel": 0.0016393251819126638,
+  "q_tgt_rel": 0.0015874905542509455,
+  "k_all_rel": 0.00014635309378520462,
+  "v_all_rel": 0.00011497182664581965,
+  "q_tgt_max_abs": 0.03125,
+  "measured_attn_o_proj_rel": 0.001739916107561774,
+  "interpretation": "If q/k/v rel << attn rel, seed is attention; if comparable, seed is upstream of attention.",
+  "q_tgt_over_attn": 0.9123948834956017,
+  "v_over_attn": 0.06607894837351386
+}

@@ -1,0 +1,272 @@
+{
+  "widen_ratio_e4m3_over_bf16": 16.0,
+  "bf16_rel": 0.0078125,
+  "e4m3_rel": 0.125,
+  "target": {
+    "heph": {
+      "argmax": 15678,
+      "top1": 33.41806411743164,
+      "top2_id": 49013,
+      "top2": 22.887706756591797,
+      "margin": 10.530357360839844,
+      "margin_bf16": 10.375,
+      "ulp": 0.25
+    },
+    "hf": {
+      "argmax": 15678,
+      "top1": 36.0,
+      "top2_id": 49013,
+      "top2": 21.625,
+      "margin": 14.375,
+      "margin_bf16": 14.375,
+      "ulp": 0.25
+    },
+    "token_96874": {
+      "heph": 16.31208610534668,
+      "hf": 4.25,
+      "abs_diff": 12.06208610534668,
+      "heph_rank": 12,
+      "hf_rank": 2282,
+      "margin_argmax_minus_tok_heph": 17.10597801208496,
+      "margin_argmax_minus_tok_hf": 31.75
+    },
+    "scale_to_flip": {
+      "hf_argmax": 15678,
+      "heph_argmax": 15678,
+      "already_differs_at_s1": false,
+      "s_flip": 2.1762404441833496,
+      "s_flip_gt": null
+    },
+    "row_mae": 1.8324486017227173,
+    "row_max": 12.06208610534668
+  },
+  "per_prompt_summary": {
+    "1": {
+      "n_already_differs_at_s1": 0,
+      "n_clear_differs_at_s1": 0,
+      "n_no_flip_below_4x_widen": 62,
+      "n_safe_s_flip_gt_16": 232,
+      "n_unsafe_s_flip_le_16": 24,
+      "s_flip_min": 1.1893463134765625,
+      "s_flip_p10": 16.513896942138672,
+      "s_flip_median": 38.44800853729248
+    },
+    "2": {
+      "n_already_differs_at_s1": 3,
+      "n_clear_differs_at_s1": 0,
+      "n_no_flip_below_4x_widen": 124,
+      "n_safe_s_flip_gt_16": 222,
+      "n_unsafe_s_flip_le_16": 34,
+      "s_flip_min": 1.52587890625e-05,
+      "s_flip_p10": 10.511877059936523,
+      "s_flip_median": 62.35613298416138
+    },
+    "3": {
+      "n_already_differs_at_s1": 3,
+      "n_clear_differs_at_s1": 0,
+      "n_no_flip_below_4x_widen": 120,
+      "n_safe_s_flip_gt_16": 208,
+      "n_unsafe_s_flip_le_16": 48,
+      "s_flip_min": 3.4332275390625e-05,
+      "s_flip_p10": 7.125952243804932,
+      "s_flip_median": 56.68197822570801
+    }
+  },
+  "worst_rows": [
+    {
+      "prompt": 2,
+      "step": 14,
+      "s_flip": 1.52587890625e-05,
+      "s_eff": 1.52587890625e-05,
+      "hf_margin": 0.0625,
+      "already_differs": true,
+      "near_tie": true
+    },
+    {
+      "prompt": 3,
+      "step": 86,
+      "s_flip": 3.4332275390625e-05,
+      "s_eff": 3.4332275390625e-05,
+      "hf_margin": 0.125,
+      "already_differs": true,
+      "near_tie": true
+    },
+    {
+      "prompt": 3,
+      "step": 176,
+      "s_flip": 6.866455078125e-05,
+      "s_eff": 6.866455078125e-05,
+      "hf_margin": 0.0,
+      "already_differs": true,
+      "near_tie": true
+    },
+    {
+      "prompt": 2,
+      "step": 22,
+      "s_flip": 0.00016307830810546875,
+      "s_eff": 0.00016307830810546875,
+      "hf_margin": 0.0625,
+      "already_differs": true,
+      "near_tie": true
+    },
+    {
+      "prompt": 3,
+      "step": 134,
+      "s_flip": 0.760584831237793,
+      "s_eff": 0.760584831237793,
+      "hf_margin": 0.125,
+      "already_differs": true,
+      "near_tie": true
+    },
+    {
+      "prompt": 2,
+      "step": 12,
+      "s_flip": 0.8036270141601562,
+      "s_eff": 0.8036270141601562,
+      "hf_margin": 0.0625,
+      "already_differs": true,
+      "near_tie": true
+    },
+    {
+      "prompt": 1,
+      "step": 4,
+      "s_flip": 1.1893463134765625,
+      "s_eff": 1.1893463134765625,
+      "hf_margin": 0.0,
+      "already_differs": false,
+      "near_tie": true
+    },
+    {
+      "prompt": 2,
+      "step": 50,
+      "s_flip": 1.1981115341186523,
+      "s_eff": 1.1981115341186523,
+      "hf_margin": 0.125,
+      "already_differs": false,
+      "near_tie": true
+    },
+    {
+      "prompt": 3,
+      "step": 106,
+      "s_flip": 1.259542465209961,
+      "s_eff": 1.259542465209961,
+      "hf_margin": 0.125,
+      "already_differs": false,
+      "near_tie": true
+    },
+    {
+      "prompt": 2,
+      "step": 32,
+      "s_flip": 1.2606086730957031,
+      "s_eff": 1.2606086730957031,
+      "hf_margin": 0.0,
+      "already_differs": false,
+      "near_tie": true
+    },
+    {
+      "prompt": 2,
+      "step": 6,
+      "s_flip": 1.3185100555419922,
+      "s_eff": 1.3185100555419922,
+      "hf_margin": 0.0,
+      "already_differs": false,
+      "near_tie": true
+    },
+    {
+      "prompt": 2,
+      "step": 84,
+      "s_flip": 1.3344297409057617,
+      "s_eff": 1.3344297409057617,
+      "hf_margin": 0.125,
+      "already_differs": false,
+      "near_tie": true
+    },
+    {
+      "prompt": 3,
+      "step": 158,
+      "s_flip": 1.4287233352661133,
+      "s_eff": 1.4287233352661133,
+      "hf_margin": 0.0,
+      "already_differs": false,
+      "near_tie": true
+    },
+    {
+      "prompt": 3,
+      "step": 120,
+      "s_flip": 1.8546390533447266,
+      "s_eff": 1.8546390533447266,
+      "hf_margin": 0.0,
+      "already_differs": false,
+      "near_tie": true
+    },
+    {
+      "prompt": 1,
+      "step": 22,
+      "s_flip": 1.9008255004882812,
+      "s_eff": 1.9008255004882812,
+      "hf_margin": 11.375,
+      "already_differs": false,
+      "near_tie": false
+    },
+    {
+      "prompt": 2,
+      "step": 0,
+      "s_flip": 1.9882822036743164,
+      "s_eff": 1.9882822036743164,
+      "hf_margin": 0.1875,
+      "already_differs": false,
+      "near_tie": false
+    },
+    {
+      "prompt": 1,
+      "step": 67,
+      "s_flip": 2.176240921020508,
+      "s_eff": 2.176240921020508,
+      "hf_margin": 14.375,
+      "already_differs": false,
+      "near_tie": false
+    },
+    {
+      "prompt": 3,
+      "step": 7,
+      "s_flip": 2.355867385864258,
+      "s_eff": 2.355867385864258,
+      "hf_margin": 0.0,
+      "already_differs": false,
+      "near_tie": true
+    },
+    {
+      "prompt": 2,
+      "step": 60,
+      "s_flip": 2.586655616760254,
+      "s_eff": 2.586655616760254,
+      "hf_margin": 0.0,
+      "already_differs": false,
+      "near_tie": true
+    },
+    {
+      "prompt": 3,
+      "step": 92,
+      "s_flip": 3.024855613708496,
+      "s_eff": 3.024855613708496,
+      "hf_margin": 0.125,
+      "already_differs": false,
+      "near_tie": true
+    }
+  ],
+  "verdict": {
+    "simple_widening_model": {
+      "non_tie_rows_with_s_flip_le_16": 81,
+      "all_rows_with_s_flip_le_16": 106,
+      "interpretation": "If non_tie_rows_with_s_flip_le_16 > 0, magnifying the measured BF16 Hephaestus-vs-HF delta by the E4M3/BF16 mantissa ratio can create clear argmax flips \u2014 anomaly is NOT benign under this model. If 0, the measured delta pattern alone is decision-safe under pure magnification; probe8's actual E4M3 quant still governs FP8 risk."
+    },
+    "probe8_concrete_e4m3": {
+      "weights_clear_flips": 3,
+      "weights_plus_acts_clear_flips": 6,
+      "source": "experiments/spike/out/probe8_fp8.json",
+      "interpretation": "A concrete per-channel E4M3 candidate already produces clear non-tie flips. That alone rejects clearing the Phase 1b entry gate with a benign claim, independent of the widening model."
+    },
+    "benign_gate_clearable": false,
+    "reason": "probe8 concrete E4M3 candidate yields clear non-tie argmax flips; benign requires no such flips under FP8-coarsened error."
+  }
+}

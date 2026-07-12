@@ -1,0 +1,43 @@
+{
+  "input": {
+    "seq_len": 77,
+    "target_row": 76,
+    "step": 67,
+    "token": 96874
+  },
+  "predictions": {
+    "A_qkv_diverges_at_seed_scale": true,
+    "B_attention_kernel_is_seed": false,
+    "C_hf_attn_impl_bound_at_layer0": {
+      "eager_vs_sdpa_attn_rel": 0.0019128838924202419,
+      "eager_vs_sdpa_residual_rel": 0.0013180198022958711,
+      "interpretation": "If Hephaestus layer-0 attn_out rel error (~0.00174) is near this HF self-spread, the seed is consistent with attention-impl variation; if much larger, something else (matmul/QKV/RoPE) dominates the seed."
+    }
+  },
+  "embed_norm": 0.7632366418838501,
+  "layer0": {
+    "manual_prod_vs_hf_sdpa_attn": 0.0021682496757112935,
+    "manual_fp32prob_vs_hf_sdpa_attn": 0.0007152606792915537,
+    "manual_scorebf16_vs_hf_sdpa_attn": 0.0020719002142224816,
+    "manual_prod_vs_hf_eager_attn": 0.0023443883303552503,
+    "hf_eager_vs_sdpa_attn": 0.0019128838924202419,
+    "manual_prod_vs_fp32prob": 0.0022109398215923184,
+    "measured_heph_layer0_attn_out_rel": 0.0017399141797795892,
+    "q_tgt_l2": 89.50932312011719,
+    "k_all_l2": 4459.4873046875,
+    "v_all_l2": 8.809768676757812,
+    "hf_eager_vs_sdpa_residual": 0.0013180198022958711
+  },
+  "heph_vs_hf_qkv": {
+    "q_tgt_rel": 0.0015874905542509455,
+    "k_all_rel": 0.0001463522747354102,
+    "v_all_rel": 0.00011497182664581965,
+    "attn_o_proj_rel_sdpa": 0.001739916107561774
+  },
+  "seed_comparison": {
+    "heph_layer0_attn_out_rel": 0.0017399141797795892,
+    "hf_eager_sdpa_attn_rel": 0.0019128838924202419,
+    "heph_over_hf_spread": 0.9095764707277628,
+    "manual_prod_closer_to_eager_than_sdpa": false
+  }
+}
