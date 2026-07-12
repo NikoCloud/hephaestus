@@ -25,20 +25,22 @@ Re-verified from the five on-disk `/tmp/spike-det-1783875368/rep{1..5}_logits.f3
 
 ## Verdict
 
-**Root cause localized to layer-0 (and by structure, every-layer) RoPE on Q — with positive replace-and-continue evidence. NOT a full single-line proof inside `rope_kernel`. NOT benign under the FP8 bar. Do not clear the Phase 1b entry gate until a RoPE fix is validated.**
+**Root cause identified (probe 14): `rope_kernel` f32-accumulates the rotate expression after bf16 cos/sin, while HF applies stepwise bf16 `(q*cos)+(rotate_half(q)*sin)`. Engine fix is a deliberate separate change to `kernels.mojo`. NOT benign under the FP8 bar until fixed and re-validated.**
 
 What is established:
 
-1. The event is **deterministic, row-wide, and upstream of the LM head**, then amplified through depth on phase-locked ill-conditioned rows.
-2. **Probe 13 cut-points (layer 0 Q):** relative error vs HF SDPA is tiny at `q_proj` (**9.88e-5**) and `q_norm` (**1.05e-4**, ×1.06), then jumps **×15.7 at RoPE** to **1.64e-3**. First elevated cut = **`q_rope`**.
-3. **Probe 13 replace-and-continue:** overwriting Hephaestus Q with HF's tensor at each cut, then continuing Hephaestus layers 0…35:
-   - `inject_q_proj` / `inject_q_norm`: partial relief (hidden rel 0.335 → 0.120; target logit 16.31 → 6.36). **Does not collapse** under the predeclared 25% rule.
-   - **`inject_q_rope`: collapses** (hidden rel → **0.038**, ratio **0.114**; target logit → **4.054** vs HF **4.25**, abs diff **0.196** = 1.6% of the original 12.06 gap).
-4. Therefore the **initiating Q-path defect is in RoPE application** (freq / cast / rotate composition in `apply_rope_inplace` / `rope_kernel`), not in `q_proj` matmul or `q_norm`. Raw GPU `cos`/`sin` accuracy alone remains ruled out (exp6); the mismatch is in the **RoPE pipeline as composed**, not bare trig ULP.
-5. Residual after Q-RoPE inject (hidden rel 0.038, still above quiet-row ~0.02) means K-RoPE / attention / later layers still contribute ordinary BF16 noise — but they are **not** what creates the 12-unit spike.
-6. **Benign is rejected** under the FP8 standard (probes 8 and 12 unchanged).
-
-What is **not** established: which exact expression inside `rope_kernel` (inv-freq construction, bf16 cast placement, rotate_half pairing, or multiply-add order) is the wrong step. That is the next one-line fix candidate, not a new search across the whole model.
+1. Deterministic, row-wide, upstream of LM head; amplified on ill-conditioned rows.
+2. **Probe 13:** seed appears at post-RoPE Q (×15.7 cut jump); **`inject_q_rope` collapses** the spike (logit 16.31→4.05 vs HF 4.25).
+3. **Probe 14 sub-step isolation:**
+   - **cos/sin construction matches** (cos bit-identical; sin 1/4928 pairs off by 1 bf16 ulp; inv_freq max_rel 1.7e-16).
+   - Closed form `re*cos±im*sin` **≡** HF `rotate_half` form in f64 (max abs 0) — **not** a pairing/sign bug.
+   - HF stepwise bf16 self-checks against HF post-RoPE dump (rel **2.07e-5**).
+   - **f32-accum closed form** (Mojo's effective path: BF16 muls promote to F32, single cast on store) vs HF post: rel **1.91e-3** ≈ dump gap **1.64e-3** (ratio **0.86**; corr pred/obs err **0.76**).
+   - **Strict bf16** closed form matches HF stepwise (same 2.07e-5).
+   - Applying HF rope to Hephaestus pre-RoPE Q recovers HF post within pre-rope noise.
+4. Locus: `src/hephaestus/kernels.mojo` `rope_kernel` store lines — `(re * cos_v) - (im * sin_v)` without intermediate bf16 casts.
+5. **Fix hint (not applied):** cast to BF16 after each mul and after add/sub (or emit the rotate_half form in bf16). More accurate f32 accum is **wrong** for HF matching.
+6. **Benign rejected** under FP8 bar (probes 8/12) until a fix is measured.
 
 ## Corrected anomaly shape
 

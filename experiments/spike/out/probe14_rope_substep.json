@@ -1,0 +1,279 @@
+{
+  "input": {
+    "seq": 77,
+    "target_row": 76,
+    "step": 67,
+    "theta": 5000000.0,
+    "head_dim": 128
+  },
+  "baselines": {
+    "pre_rope_heph_vs_hf": {
+      "all_rel": 0.00010474586568987531,
+      "tgt_rel": 2.18175490074482e-05,
+      "all_max_abs": 0.03125
+    },
+    "post_rope_heph_vs_hf": {
+      "all_rel": 0.0016393251819126638,
+      "tgt_rel": 0.0015874905542509455,
+      "all_max_abs": 0.0625
+    }
+  },
+  "cos_sin": {
+    "heph_vs_hf_cos_all_rel": 0.0,
+    "heph_vs_hf_sin_all_rel": 4.453479197821513e-06,
+    "heph_vs_hf_cos_max_abs": 0.0,
+    "heph_vs_hf_sin_max_abs": 0.0001220703125,
+    "heph_vs_hf_cos_tgt_rel": 0.0,
+    "heph_vs_hf_sin_tgt_rel": 0.0,
+    "n_cos_differ": 0,
+    "n_sin_differ": 1,
+    "n_total_pairs": 4928,
+    "worst_pos_cos": {
+      "pos": 0,
+      "max_abs": 0.0
+    },
+    "worst_pos_sin": {
+      "pos": 68,
+      "max_abs": 0.0001220703125
+    },
+    "inv_freq_max_rel": 1.7384955331238798e-16,
+    "inv_freq_max_abs": 1.1102230246251565e-16
+  },
+  "rotate_isolation": {
+    "hf_rotate_half__hf_cos": {
+      "vs_hf_post_all_rel": 2.0731715773983502e-05,
+      "vs_hf_post_tgt_rel": 0.0,
+      "vs_hf_post_max_abs": 0.015625,
+      "vs_heph_post_all_rel": 0.001639077735469178,
+      "vs_heph_post_tgt_rel": 0.001587411092214578,
+      "vs_heph_post_max_abs": 0.0625
+    },
+    "heph_closed_f32accum__hf_cos": {
+      "vs_hf_post_all_rel": 0.0019091990143428863,
+      "vs_hf_post_tgt_rel": 0.0018969100155987206,
+      "vs_hf_post_max_abs": 0.0625,
+      "vs_heph_post_all_rel": 0.0012189788516811678,
+      "vs_heph_post_tgt_rel": 0.0012323073905690562,
+      "vs_heph_post_max_abs": 0.0625
+    },
+    "heph_closed_strict_bf16__hf_cos": {
+      "vs_hf_post_all_rel": 2.0731715773983502e-05,
+      "vs_hf_post_tgt_rel": 0.0,
+      "vs_hf_post_max_abs": 0.015625,
+      "vs_heph_post_all_rel": 0.001639077735469178,
+      "vs_heph_post_tgt_rel": 0.001587411092214578,
+      "vs_heph_post_max_abs": 0.0625
+    },
+    "hf_rotate_half__heph_cos": {
+      "vs_hf_post_all_rel": 4.765239958370597e-06,
+      "vs_hf_post_tgt_rel": 0.0,
+      "vs_hf_post_max_abs": 0.00390625,
+      "vs_heph_post_all_rel": 0.001639201897765166,
+      "vs_heph_post_tgt_rel": 0.001587411092214578,
+      "vs_heph_post_max_abs": 0.0625
+    },
+    "heph_closed_f32accum__heph_cos": {
+      "vs_hf_post_all_rel": 0.0019092235565139196,
+      "vs_hf_post_tgt_rel": 0.0018969100155987206,
+      "vs_hf_post_max_abs": 0.0625,
+      "vs_heph_post_all_rel": 0.0012190230448229844,
+      "vs_heph_post_tgt_rel": 0.0012323073905690562,
+      "vs_heph_post_max_abs": 0.0625
+    },
+    "heph_closed_strict_bf16__heph_cos": {
+      "vs_hf_post_all_rel": 4.765239958370597e-06,
+      "vs_hf_post_tgt_rel": 0.0,
+      "vs_hf_post_max_abs": 0.00390625,
+      "vs_heph_post_all_rel": 0.001639201897765166,
+      "vs_heph_post_tgt_rel": 0.001587411092214578,
+      "vs_heph_post_max_abs": 0.0625
+    }
+  },
+  "reconstruction": {
+    "hf_rotate_half__hf_cos": {
+      "vs_hf_post_all_rel": 2.0731715773983502e-05,
+      "fraction_of_dump_gap": 0.012646493815092263,
+      "explains_dump": true
+    },
+    "heph_closed_f32accum__hf_cos": {
+      "vs_hf_post_all_rel": 0.0019091990143428863,
+      "fraction_of_dump_gap": 1.1646249538577516,
+      "explains_dump": false
+    },
+    "heph_closed_strict_bf16__hf_cos": {
+      "vs_hf_post_all_rel": 2.0731715773983502e-05,
+      "fraction_of_dump_gap": 0.012646493815092263,
+      "explains_dump": true
+    },
+    "hf_rotate_half__heph_cos": {
+      "vs_hf_post_all_rel": 4.765239958370597e-06,
+      "fraction_of_dump_gap": 0.002906830207299572,
+      "explains_dump": true
+    },
+    "heph_closed_f32accum__heph_cos": {
+      "vs_hf_post_all_rel": 0.0019092235565139196,
+      "fraction_of_dump_gap": 1.1646399247563286,
+      "explains_dump": false
+    },
+    "heph_closed_strict_bf16__heph_cos": {
+      "vs_hf_post_all_rel": 4.765239958370597e-06,
+      "fraction_of_dump_gap": 0.002906830207299572,
+      "explains_dump": true
+    },
+    "hf_rotate_half__hf_cos__heph_pre": {
+      "vs_hf_post_all_rel": 0.00010687226230620042,
+      "fraction_of_dump_gap": 0.06519283878840221,
+      "explains_dump": true
+    },
+    "heph_closed_f32accum__hf_cos__heph_pre": {
+      "vs_hf_post_all_rel": 0.0019120578936088802,
+      "fraction_of_dump_gap": 1.1663688905077445,
+      "explains_dump": false
+    },
+    "heph_closed_strict_bf16__hf_cos__heph_pre": {
+      "vs_hf_post_all_rel": 0.00010687226230620042,
+      "fraction_of_dump_gap": 0.06519283878840221,
+      "explains_dump": true
+    },
+    "hf_rotate_half__heph_cos__heph_pre": {
+      "vs_hf_post_all_rel": 0.00010495038791435181,
+      "fraction_of_dump_gap": 0.06402048176427215,
+      "explains_dump": true
+    },
+    "heph_closed_f32accum__heph_cos__heph_pre": {
+      "vs_hf_post_all_rel": 0.0019120823990853115,
+      "fraction_of_dump_gap": 1.166383839022354,
+      "explains_dump": false
+    },
+    "heph_closed_strict_bf16__heph_cos__heph_pre": {
+      "vs_hf_post_all_rel": 0.00010495038791435181,
+      "fraction_of_dump_gap": 0.06402048176427215,
+      "explains_dump": true
+    }
+  },
+  "pair_concentration": {
+    "top_pairs_by_mean_abs": [
+      {
+        "pair": 27,
+        "mean_abs": 0.0022029876708984375,
+        "angle_at_target": 0.11341894981882968
+      },
+      {
+        "pair": 2,
+        "mean_abs": 0.002185821533203125,
+        "angle_at_target": 46.932185617600574
+      },
+      {
+        "pair": 21,
+        "mean_abs": 0.002044677734375,
+        "angle_at_target": 0.4816305866284304
+      },
+      {
+        "pair": 13,
+        "mean_abs": 0.00202178955078125,
+        "angle_at_target": 3.3119617324246797
+      },
+      {
+        "pair": 14,
+        "mean_abs": 0.0019683837890625,
+        "angle_at_target": 2.602638823341865
+      },
+      {
+        "pair": 9,
+        "mean_abs": 0.001857757568359375,
+        "angle_at_target": 8.685022250507725
+      },
+      {
+        "pair": 23,
+        "mean_abs": 0.0017061233520507812,
+        "angle_at_target": 0.2974207380363072
+      },
+      {
+        "pair": 11,
+        "mean_abs": 0.0016508102416992188,
+        "angle_at_target": 5.363251004655521
+      }
+    ],
+    "pair0_mean_abs": 0.0009031295776367188,
+    "pair_half_mean_abs": 0.0,
+    "pair_last_mean_abs": 0.0,
+    "corr_abs_vs_pair_index": -0.608451448849828
+  },
+  "verdict": {
+    "root_cause_class": "rotate_apply_f32_accum_vs_hf_bf16_stepwise",
+    "cos_sin_match": true,
+    "cos_identical": true,
+    "sin_n_diff_pairs": 1,
+    "sin_max_abs": 0.0001220703125,
+    "inv_freq_effectively_identical": true,
+    "algebraic_closed_form_eq_rotate_half_f64": true,
+    "evidence": {
+      "hf_stepwise_bf16_on_hf_pre_vs_hf_post_rel": 2.07317e-05,
+      "strict_bf16_closed_on_hf_pre_vs_hf_post_rel": 2.07317e-05,
+      "f32_accum_closed_on_hf_pre_vs_hf_post_rel": 0.0019092,
+      "heph_dump_vs_hf_post_rel": 0.00163933,
+      "gap_ratio_dump_over_f32_model": 0.8586,
+      "corr_pred_f32_err_vs_obs_dump_err": 0.7646,
+      "hf_stepwise_on_heph_pre_vs_hf_post_rel": 0.00010687,
+      "note": "cos/sin construction matches (1 sin pair differs by 1 bf16 ulp). Closed form == rotate_half in f64. HF dump self-checks under stepwise bf16 (q*cos)+(rotate_half(q)*sin). f32-accum closed form (what rope_kernel does: BF16 ops promote, single cast on store) reproduces the dump gap magnitude. probe13 inject_q_rope collapses the spike \u2014 positive causal chain."
+    },
+    "one_line_fix_hint": "In rope_kernel, match HF bf16 stepwise arithmetic: compute out_re/out_im with a cast to BF16 after each mul and after the add/sub (or write the rotate_half form explicitly). Today `(re*cos)-(im*sin)` accumulates in f32 then stores BF16, which is more accurate than HF and therefore wrong for token-exact match.",
+    "engine_locus": "src/hephaestus/kernels.mojo rope_kernel lines ~142-143",
+    "fix_is_separate_decision": true
+  },
+  "rotate_isolation_heph_pre": {
+    "hf_rotate_half__hf_cos__heph_pre": {
+      "vs_hf_post_all_rel": 0.00010687226230620042,
+      "vs_heph_post_all_rel": 0.0016357306518083043,
+      "vs_hf_post_tgt_rel": 2.1820331527632303e-05,
+      "vs_heph_post_tgt_rel": 0.0015872611305270121
+    },
+    "heph_closed_f32accum__hf_cos__heph_pre": {
+      "vs_hf_post_all_rel": 0.0019120578936088802,
+      "vs_heph_post_all_rel": 0.001214534999461572,
+      "vs_hf_post_tgt_rel": 0.0018970355120942553,
+      "vs_heph_post_tgt_rel": 0.0012321142096604221
+    },
+    "heph_closed_strict_bf16__hf_cos__heph_pre": {
+      "vs_hf_post_all_rel": 0.00010687226230620042,
+      "vs_heph_post_all_rel": 0.0016357306518083043,
+      "vs_hf_post_tgt_rel": 2.1820331527632303e-05,
+      "vs_heph_post_tgt_rel": 0.0015872611305270121
+    },
+    "hf_rotate_half__heph_cos__heph_pre": {
+      "vs_hf_post_all_rel": 0.00010495038791435181,
+      "vs_heph_post_all_rel": 0.0016358550681497962,
+      "vs_hf_post_tgt_rel": 2.1820331527632303e-05,
+      "vs_heph_post_tgt_rel": 0.0015872611305270121
+    },
+    "heph_closed_f32accum__heph_cos__heph_pre": {
+      "vs_hf_post_all_rel": 0.0019120823990853115,
+      "vs_heph_post_all_rel": 0.0012145793542954208,
+      "vs_hf_post_tgt_rel": 0.0018970355120942553,
+      "vs_heph_post_tgt_rel": 0.0012321142096604221
+    },
+    "heph_closed_strict_bf16__heph_cos__heph_pre": {
+      "vs_hf_post_all_rel": 0.00010495038791435181,
+      "vs_heph_post_all_rel": 0.0016358550681497962,
+      "vs_hf_post_tgt_rel": 2.1820331527632303e-05,
+      "vs_heph_post_tgt_rel": 0.0015872611305270121
+    }
+  },
+  "element_target": {
+    "max_abs": 0.03125,
+    "mean_abs": 0.0004918312188237906,
+    "argmax_head": 2,
+    "argmax_dim": 21
+  },
+  "summary_lines": [
+    "cos: bit-identical heph vs hf construction; sin: 1/4928 pairs differ by 1 ulp",
+    "inv_freq max_rel 1.7e-16 \u2014 not the seed",
+    "f64: closed form \u2261 rotate_half (max abs 0)",
+    "HF stepwise bf16 self-check vs hf_post rel=2.07e-5",
+    "f32-accum closed form vs hf_post rel=1.91e-3 \u2248 dump gap 1.64e-3 (ratio 0.86)",
+    "strict bf16 closed form matches HF stepwise (same 2.07e-5)",
+    "HF rope on heph_pre recovers hf_post within pre-rope noise (rel=1.07e-4)",
+    "ROOT_CAUSE: rope_kernel f32-accumulates rotate after bf16 cos/sin; HF uses stepwise bf16",
+    "FIX_HINT: cast to BF16 after each mul and add/sub in rope_kernel (separate decision)"
+  ]
+}
