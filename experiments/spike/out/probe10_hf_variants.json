@@ -1,0 +1,64 @@
+{
+  "input": {
+    "prompt_len": 10,
+    "seq_len": 77,
+    "step": 67,
+    "token": 96874
+  },
+  "values": {
+    "hf_sdpa": {
+      "target": 4.25,
+      "bits": "0x40880000",
+      "argmax": 15678,
+      "target_rank": 2282
+    },
+    "hf_eager": {
+      "target": 4.375,
+      "bits": "0x408c0000",
+      "argmax": 15678,
+      "target_rank": 2295
+    },
+    "hephaestus": {
+      "target": 16.31208610534668,
+      "bits": "0x41827f27",
+      "argmax": 15678,
+      "target_rank": 12
+    }
+  },
+  "row_stats": {
+    "heph_vs_sdpa": {
+      "mean": 1.8324485756058175,
+      "median": 1.6288056373596191,
+      "p99": 5.628329002857208,
+      "p999": 7.352866664826894,
+      "max": 12.06208610534668,
+      "argmax_equal": true
+    },
+    "heph_vs_eager": {
+      "mean": 1.775517688534686,
+      "median": 1.573273554444313,
+      "p99": 5.489531636238098,
+      "p999": 7.242376348376284,
+      "max": 11.93708610534668,
+      "argmax_equal": true
+    },
+    "eager_vs_sdpa": {
+      "mean": 0.17892001340049613,
+      "median": 0.125,
+      "p99": 0.609375,
+      "p999": 0.78125,
+      "max": 1.37890625,
+      "argmax_equal": true
+    }
+  },
+  "hidden_rel": {
+    "heph_vs_sdpa": 0.3345107048505526,
+    "heph_vs_eager": 0.3258204395928806,
+    "eager_vs_sdpa": 0.046077811746591285
+  },
+  "prediction": {
+    "heph_materially_closer_to_eager": false,
+    "sole_cause": false,
+    "interpretation": "HF eager is only marginally closer than SDPA; this rejects eager-style BF16 probability rounding as the main or sole explanation. The separate probability-FP32 intervention still shows that this rounding choice contributes to sensitivity."
+  }
+}

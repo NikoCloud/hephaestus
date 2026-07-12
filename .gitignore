@@ -4,3 +4,4 @@
 
 # staged weight blobs (derived artifacts)
 staged/
+__pycache__/
