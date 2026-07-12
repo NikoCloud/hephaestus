@@ -69,7 +69,7 @@ Scope (exhaustive — if it's not listed, it's not in):
 
 **Exit gate (all must pass):**
 - [x] **G1a-1: PASS** (2026-07-12) — correctness vs HF Qwen3-4B-Instruct-2507, restated as a three-part checkable gate (below); measured in `bench/1a.md`
-- [ ] G1a-2: ≥ **90%** of llama.cpp single-stream decode tok/s, same model converted to **F16 GGUF** via `convert_hf_to_gguf.py` (we make the F16 GGUF ourselves), same card, ≥3 runs each — **unchecked**: 49.13 tok/s measured (89.1% of llama.cpp's raw 55.14, 99.0% of the 49.63 target). Gap characterized as fixed per-kernel-launch overhead, not bandwidth (75%+ utilization already); closing it needs profiling, not further launch-count counting. `bench/1a.md`
+- [x] **G1a-2: PASS** (2026-07-13) — ≥ **90%** of llama.cpp single-stream decode tok/s: **54.22 tok/s measured (98.3% of llama.cpp's raw 55.14, 109.2% of the 49.63 target)**. Root cause found by profiling (not guessing): attention's score-computation loop is O(n_keys) and was single-warp; fixed by striding independent per-key score computations across 4 warps (no reduction-order change — softmax and the weighted-V-sum stay single-warp, bit-identical). `bench/1a.md`
 - [x] **G1a-3: PASS** (2026-07-12) — loads in ~6.3s warm, ≤~8.5s cold bound; measured in `bench/1a.md`
 - Benchmark log committed to repo (`bench/1a.md`)
 

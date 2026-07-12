@@ -324,8 +324,11 @@ comptime WARP = 32
 comptime MAX_KEYS = 4096
 
 
+comptime ATTN_NUM_WARPS = 4
+
+
 def attention_kernel[
-    head_dim: Int, group: Int
+    head_dim: Int, group: Int, NUM_WARPS: Int = ATTN_NUM_WARPS
 ](
     out_ptr: UnsafePointer[Scalar[BF16], MutAnyOrigin],
     q_ptr: UnsafePointer[Scalar[BF16], ImmutAnyOrigin],
@@ -342,7 +345,9 @@ def attention_kernel[
     if head >= n_heads or tok >= seq:
         return
     var kv_head = head // group
-    var lane = Int(thread_idx.x)
+    var tid = Int(thread_idx.x)
+    var lane = tid % WARP
+    var warp_id = tid // WARP
 
     var scores = stack_allocation[
         MAX_KEYS, F32, address_space = AddressSpace.SHARED
@@ -352,6 +357,8 @@ def attention_kernel[
     ]()
 
     var q_base = (tok * n_heads + head) * head_dim
+    # Redundant across warps (every warp writes the same values) -- cheap
+    # (head_dim=128 elements) and avoids a warp-0-only-then-barrier dance.
     var d = lane
     while d < head_dim:
         q_sh[d] = q_ptr[q_base + d].cast[F32]()
@@ -362,7 +369,16 @@ def attention_kernel[
     var n_keys = past + tok + 1
 
     # --- scores = scale * (q . k_j), warp-reduced dot per key ---------------
-    var j = 0
+    # G1a-2: this loop is O(n_keys) and n_keys grows with decode position (up
+    # to ~265 here) -- profiling showed attention at 24% of step time when
+    # averaged honestly over a full 256-token run (vs 6.9% sampled only from
+    # early, short-context steps). Each scores[j] is an INDEPENDENT
+    # computation (no cross-j dependency), so striding the j-loop across
+    # NUM_WARPS warps -- each still doing the identical per-key warp-reduce
+    # over head_dim -- computes every score exactly as before, just more of
+    # them at once. This does NOT change any reduction order: softmax and the
+    # weighted-V-sum below remain single-warp, unchanged, bit-for-bit.
+    var j = warp_id
     while j < n_keys:
         var k_base = (j * n_kv_heads + kv_head) * head_dim
         var partial = Float32(0)
@@ -382,11 +398,11 @@ def attention_kernel[
             # The reference's effective precision is higher than its Python
             # source suggests; do not "match" it past what the evidence supports.
             scores[j] = partial * scale
-        j += 1
+        j += NUM_WARPS
     barrier()
 
-    # --- softmax over scores[0 .. n_keys) ----------------------------------
-    if lane == 0:
+    # --- softmax over scores[0 .. n_keys) -- single warp, UNCHANGED order --
+    if warp_id == 0 and lane == 0:
         var m = Float32(-3.4e38)
         for jj in range(n_keys):
             m = max(m, scores[jj])
@@ -406,16 +422,17 @@ def attention_kernel[
             )
     barrier()
 
-    # --- out = sum_j p_j * v_j ---------------------------------------------
-    var o_base = (tok * n_heads + head) * head_dim
-    var od = lane
-    while od < head_dim:
-        var acc = Float32(0)
-        for jj in range(n_keys):
-            var v_base = (jj * n_kv_heads + kv_head) * head_dim
-            acc += scores[jj] * v_ptr[v_base + od].cast[F32]()
-        out_ptr[o_base + od] = acc.cast[BF16]()
-        od += WARP
+    # --- out = sum_j p_j * v_j -- single warp, UNCHANGED accumulation order -
+    if warp_id == 0:
+        var o_base = (tok * n_heads + head) * head_dim
+        var od = lane
+        while od < head_dim:
+            var acc = Float32(0)
+            for jj in range(n_keys):
+                var v_base = (jj * n_kv_heads + kv_head) * head_dim
+                acc += scores[jj] * v_ptr[v_base + od].cast[F32]()
+            out_ptr[o_base + od] = acc.cast[BF16]()
+            od += WARP
 
 
 def attention[
@@ -445,7 +462,7 @@ def attention[
         past,
         scale,
         grid_dim=(n_heads, seq),
-        block_dim=(WARP,),
+        block_dim=(WARP * ATTN_NUM_WARPS,),
     )
 
 
