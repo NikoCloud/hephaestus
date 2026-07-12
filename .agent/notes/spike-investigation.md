@@ -25,22 +25,16 @@ Re-verified from the five on-disk `/tmp/spike-det-1783875368/rep{1..5}_logits.f3
 
 ## Verdict
 
-**Root cause identified (probe 14): `rope_kernel` f32-accumulates the rotate expression after bf16 cos/sin, while HF applies stepwise bf16 `(q*cos)+(rotate_half(q)*sin)`. Engine fix is a deliberate separate change to `kernels.mojo`. NOT benign under the FP8 bar until fixed and re-validated.**
+**RoPE f32-accum root cause (probe 14) is fixed and verified at the cut-point. The 12-unit spike does NOT clear — remaining seed is layer-0 `q_proj` (matmul). FP8 bar still fails. Do not clear Phase 1b entry.**
 
 What is established:
 
 1. Deterministic, row-wide, upstream of LM head; amplified on ill-conditioned rows.
-2. **Probe 13:** seed appears at post-RoPE Q (×15.7 cut jump); **`inject_q_rope` collapses** the spike (logit 16.31→4.05 vs HF 4.25).
-3. **Probe 14 sub-step isolation:**
-   - **cos/sin construction matches** (cos bit-identical; sin 1/4928 pairs off by 1 bf16 ulp; inv_freq max_rel 1.7e-16).
-   - Closed form `re*cos±im*sin` **≡** HF `rotate_half` form in f64 (max abs 0) — **not** a pairing/sign bug.
-   - HF stepwise bf16 self-checks against HF post-RoPE dump (rel **2.07e-5**).
-   - **f32-accum closed form** (Mojo's effective path: BF16 muls promote to F32, single cast on store) vs HF post: rel **1.91e-3** ≈ dump gap **1.64e-3** (ratio **0.86**; corr pred/obs err **0.76**).
-   - **Strict bf16** closed form matches HF stepwise (same 2.07e-5).
-   - Applying HF rope to Hephaestus pre-RoPE Q recovers HF post within pre-rope noise.
-4. Locus: `src/hephaestus/kernels.mojo` `rope_kernel` store lines — `(re * cos_v) - (im * sin_v)` without intermediate bf16 casts.
-5. **Fix hint (not applied):** cast to BF16 after each mul and after add/sub (or emit the rotate_half form in bf16). More accurate f32 accum is **wrong** for HF matching.
-6. **Benign rejected** under FP8 bar (probes 8/12) until a fix is measured.
+2. **Probe 14:** `rope_kernel` f32-accumulated rotate vs HF stepwise bf16 — **confirmed and patched** (see “Verified fix” below).
+3. **Post-fix cut-points:** post-RoPE Q rel vs HF drops **1.64e-3 → 1.07e-4** (now ≈ pre-rope noise). RoPE is no longer the elevated cut.
+4. **Post-fix spike (probe 13 control):** logit[96874] still **16.38** (abs diff **12.13** vs HF 4.25) — **not** the hoped-for ~0.20.
+5. **Post-fix inject re-ablation** (with fixed rope): `inject_q_proj` / `inject_q_norm` now **collapse** (logit → **4.71**, abs ~0.46; hidden rel ~0.046). So the remaining causal seed is **`q_proj` matmul**, not RoPE. Pre-fix, broken rope re-corrupted injected pre-rope Q, masking this.
+6. **Probe 12 post-fix:** non-tie `s_flip≤16` rows **81 → 74** (slight); target `s_flip` still ~2.16. **Benign still rejected.**
 
 ## Corrected anomaly shape
 
@@ -218,24 +212,84 @@ Algebraically identical in f64; **not** identical under bf16 rounding. The f32 p
 
 Element view (target row): q_rope mean abs 0.00049, max 0.03125; **not** concentrated on highest-freq pair 0 (mean 0.00033) — consistent with systematic rounding-mode difference, not a trig-domain failure.
 
-**Engine locus:** `src/hephaestus/kernels.mojo` `rope_kernel` ~L142–143:
+**Engine locus (fixed):** `src/hephaestus/kernels.mojo` `rope_kernel` — stepwise bf16 casts after each mul and after add/sub.
+
+Evidence: `out/probe14_rope_substep.json`, `probe14_rope_substep.py`.
+
+## Verified fix — stepwise BF16 RoPE (2026-07-12)
+
+**Applied** on `investigate/logit-spike` only (not main).
+
+### Patch
 
 ```mojo
-x[base + i_re] = (re * cos_v) - (im * sin_v)   # f32 accum, one store cast
+# Before (f32-accum, one store cast):
+x[base + i_re] = (re * cos_v) - (im * sin_v)
 x[base + i_im] = (im * cos_v) + (re * sin_v)
+
+# After (HF-matching stepwise bf16):
+var re_c = (re.cast[F32]() * cos_v.cast[F32]()).cast[BF16]()
+var im_s = (im.cast[F32]() * sin_v.cast[F32]()).cast[BF16]()
+var im_c = (im.cast[F32]() * cos_v.cast[F32]()).cast[BF16]()
+var re_s = (re.cast[F32]() * sin_v.cast[F32]()).cast[BF16]()
+x[base + i_re] = (re_c.cast[F32]() - im_s.cast[F32]()).cast[BF16]()
+x[base + i_im] = (im_c.cast[F32]() + re_s.cast[F32]()).cast[BF16]()
 ```
 
-**Proposed fix (NOT applied — separate decision):** force bf16 after each mul and after add/sub, e.g. match HF's stepwise rounding, or write the rotate_half form with bf16 casts. Then re-run teacher-forced / probe 13 inject control as regression.
+### Cut-point verification (probe 13 dump)
 
-Evidence: `out/probe14_rope_substep.json`, `probe14_rope_substep.py`, `probe14_roped_element_analysis.py`.  
-Causal chain: probe 13 inject proves RoPE Q is sufficient; probe 14 proves **which arithmetic** inside RoPE.
+| cut | pre-fix all_rel | post-fix all_rel |
+|---|---:|---:|
+| q_norm | 1.05e-4 | 1.05e-4 (unchanged) |
+| **q_rope** | **1.64e-3** | **1.07e-4** |
 
-## Next step (fix — out of investigation scope)
+Target-row q_rope rel: **1.59e-3 → 2.18e-5**. RoPE sub-step defect is **gone**.
 
-One deliberate patch to `rope_kernel`, then re-measure:
-- target logit[96874] should move from 16.31 toward 4.25
-- full-vocab max_abs_diff and 768-step non-tie flips
-- only then reconsider Phase 1b entry / FP8 bar
+### Spike verification (probe 13 control — NOT cleared)
+
+| metric | pre-fix | post-fix | hoped |
+|---|---:|---:|---:|
+| logit[96874] | 16.312 | **16.380** | ~4.25 |
+| abs vs HF 4.25 | 12.062 | **12.130** | ~0.20 |
+| hidden rel vs HF | 0.3345 | **0.3216** | ≪0.1 |
+| step-67 row median abs | 1.629 | **1.564** | small |
+
+**Spike does not drop.** Expectation that rope-only fix would yield inject_q_rope’s ~0.20 abs was wrong: that inject replaced the **entire** post-RoPE Q (killing pre-rope error too).
+
+### Post-fix inject re-ablation (causal residual)
+
+| mode | logit[96874] | abs vs 4.25 | hidden_rel |
+|---|---:|---:|---:|
+| control (fixed rope) | 16.380 | 12.130 | 0.322 |
+| **inject_q_proj** | **4.713** | **0.463** | **0.046** |
+| inject_q_norm | 4.713 | 0.463 | 0.046 |
+| inject_q_rope | 4.842 | 0.592 | 0.054 |
+
+With rope fixed, **`inject_q_proj` collapses the spike.** Remaining seed = **`q_proj` matmul** (naive GPU vs torch reduction/rounding), amplified through depth on ill-conditioned rows.
+
+### Probe 12 FP8 margin (post-fix)
+
+| | pre-fix | post-fix |
+|---|---:|---:|
+| target abs diff | 12.062 | 12.130 |
+| target s_flip | 2.176 | 2.164 |
+| non-tie rows s_flip≤16 | **81** | **74** |
+
+Slight improvement; **not** cleared. `out/probe12_fp8_margin_post_rope_fix.json`.
+
+### Teacher-forced max_abs (post-fix)
+
+| prompt | max_abs | at |
+|---|---:|---|
+| 1 | **12.13** | step 67, tok 96874 |
+| 2 | 8.81 | step 215 |
+| 3 | **0.90** | step 205 (was 1.75 pre-fix) |
+
+Prompt 3 improved; prompt 1 spike intact.
+
+## Next discriminating probe (remaining seed)
+
+`q_proj` matmul at layer 0 (and likely all layers): compare Hephaestus `matmul_kernel_naive` / GEMM path to HF Linear on the same normed residual. Options: match reduction order, accumulate in higher precision then cast, or vendor a path that bit-matches torch on this shape. Separate from the RoPE fix.
 
 ## Artifact map
 
