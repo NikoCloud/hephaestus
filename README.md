@@ -4,7 +4,7 @@
 
 A lightweight, GUI-less LLM inference engine written in [Mojo](https://www.modular.com/mojo). Loads FP8 E4M3 **safetensors directly** — no GGUF, no conversion step, no translation layers — and feeds them straight to RDNA4's WMMA matrix units.
 
-> **Status: pre-alpha, Phase 1a in progress.** Nothing here is ready to use. The baseline is measured, the oracle fixtures exist, the loader is being written. Star and watch if the mission matters to you; come back when the numbers below start filling in.
+> **Status: pre-alpha, Phase 1a complete (G1a-1/2/3 PASS), Phase 1b not started.** BF16 Qwen3-4B forward path works on RDNA4 and clears the Phase 1a gates. There is still no FP8 path, no HTTP server, and no general model support — not a drop-in llama.cpp replacement. Star and watch if the mission matters; come back when 1b numbers appear.
 
 ---
 
@@ -36,20 +36,41 @@ Numbers are published as they're measured — including the losses. Baseline har
 
 | Phase | Goal | Gate | Status |
 |---|---|---|---|
-| **1a — It Thinks** | BF16 forward pass, token-exact vs a `transformers` oracle | ≥ 90% of llama.cpp F16 single-stream (**≥ 49.6 tok/s** vs measured 55.1) | 🔨 in progress |
-| **1b — The Thesis** | Native FP8 WMMA path, no FP32 fallback in any hot loop | ≥ llama.cpp Q8_0 decode; ≥ 1.5× its prefill at 4K prompts | ⏳ |
+| **1a — It Thinks** | BF16 forward pass of Qwen3-4B; teacher-forced argmax fidelity vs HF; load ≤30s | ≥ 90% of llama.cpp F16 decode vs **original** 55.14 baseline (**≥ 49.6 tok/s**) | ✅ **PASS** — see `bench/1a.md`, `bench/1a-ab.md` |
+| **1b — The Thesis** | Native FP8 WMMA path, no FP32 fallback in any hot loop | PPL within 1% of BF16; ≥ llama.cpp Q8_0 decode; ≥ 1.5× its prefill at 4K | ⏳ entry cleared; not started |
 | **2 — The Multiplier** | Continuous batching, paged KV, HTTP serving | ≥ 3× aggregate throughput at 8 concurrent requests | ⏳ |
 | **3 — Ecosystem** | Layout-tagged loading, more architectures, the parking lot | — | ⏳ |
 
-Why 90% and not parity in 1a: single-stream decode is memory-bandwidth-bound; the last 10% costs months and buys little. Phase 2 is where this engine pulls ahead — concurrency is the point, single-stream is the credential.
+### Phase 1a numbers (honest, R9700, Qwen3-4B-Instruct-2507)
 
-Why BF16 before FP8: a token-exact BF16 pass in the *same engine* is the numerics reference that makes FP8 kernels debuggable. Correctness first, thesis second.
+Measured 2026-07-13 post GPU-argmax fix (`bench/1a-ab.md`). llama.cpp F16 same card/build.
+
+| Metric | Hephaestus BF16 | llama.cpp F16 | Notes |
+|---|---:|---:|---|
+| Decode tok/s (**forward only** — G1a-2 metric) | **53.7** | 62.0 | Gate used original llama **55.14** baseline → **98% / 109% of 90% target** |
+| Decode tok/s (**incl. greedy sampling**) | **52.8** | 61.8 | Was ~14 tok/s with host argmax; GPU argmax ~0.3 ms/step |
+| Total time (10-tok prompt × 256 gen) | **4.94 s** | 5.17 s | Was **18.0 s** before GPU argmax |
+| Prefill tok/s (10 / 512 tok) | ~95 / ~121 | ~148 / ~1430 | Prefill is still weak; not a 1a gate |
+| Peak VRAM | **~29.6 GB** | ~8.1 GB | MAX/AsyncRT reserves ~90% of card on first buffer — not loader bloat; not a leak |
+| Load time | ~6–8 s | — | G1a-3 PASS |
+
+**Correctness (G1a-1):** teacher-forced argmax matches HF on non-ties across 768 steps (0 non-tie flips). Full-vocab logit spikes vs HF exist and are **characterized** (RoPE stepwise-bf16 fixed; residual = irreducible BF16 matmul reduction-order ULPs) — not claimed bit-identical to HF across the whole vocab. Details: `.agent/notes/spike-investigation.md`.
+
+**Caveats you should not miss:**
+
+- G1a-2’s 90% bar is vs the **2026-07-11** llama.cpp 55.14 tok/s citation. Fresh llama.cpp on the same machine later measured ~62 tok/s; against *that* number Hephaestus is ~87% — see `bench/1a-ab.md` Finding 1.
+- Single architecture hard-coded (Qwen3 dense 4B). CLI only. No server, no batching, no FP8 yet.
+- Matmul/attention are hand-written/naive where WMMA is unavailable on this Mojo nightly for gfx1201 — FP8 WMMA is the 1b thesis, not a delivered path.
+
+Why 90% and not parity in 1a: single-stream decode is memory-bandwidth-bound; the last 10% costs months and buys little. Phase 2 is where this engine is supposed to pull ahead — concurrency is the point, single-stream is the credential.
+
+Why BF16 before FP8: a validated BF16 pass in the *same engine* is the numerics reference that makes FP8 kernels debuggable. Correctness first, thesis second.
 
 ## Design positions
 
-- **Vendored kernels, original engine.** Matmul/attention kernels come from [Modular's open kernel library](https://github.com/modular/modular) (Apache 2.0) — 450k lines of production Mojo, including RDNA-specific WMMA paths. We write the layer they don't ship: loader, scheduler, KV management, serving.
-- **The FP8 tier is canonical, not a fallback.** There is no code path that dequantizes FP8 to FP32 for compute. If it can't run native, it fails loudly.
-- **Validated, not vibed.** Every forward-pass change is diffed token-exact against a HuggingFace `transformers` oracle. A tiny-random model with the real architecture gives a millisecond debug loop.
+- **Vendor where it compiles; write what must match.** MAX kernels are vendored when they work on gfx1201. On this Mojo nightly, WMMA paths do not compile for RDNA4, so Phase 1a matmul/attention/argmax are hand-written (and documented). Scheduler, HTTP, and multi-arch are still future work.
+- **The FP8 tier is canonical, not a fallback.** When 1b lands, there will be no code path that dequantizes FP8 to FP32 for compute. If it can't run native, it fails loudly. (FP8 is not implemented yet.)
+- **Validated, not vibed.** Forward-pass changes are checked against HuggingFace `transformers` with a restated gate (teacher-forced argmax fidelity + one clean full decode + decision-boundary ties) — not “it looks fluent.” A tiny-random model with the real architecture is the millisecond debug loop.
 - **Effective bandwidth utilization is the honest metric.** Achieved tok/s divided by the memory-bandwidth ceiling for the model's byte-width. It's how we know whether a gap is kernel work or physics.
 - **Placement is a first-class concern.** Asymmetric multi-GPU (e.g. 32GB + 16GB) is normal in consumer rigs and tensor parallelism wastes it. One engine per card now; smarter scheduling is parked, deliberately, for Phase 3.
 
