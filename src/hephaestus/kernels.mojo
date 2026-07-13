@@ -478,6 +478,158 @@ def attention_kernel[
             od += WARP
 
 
+# Phase bitmasks for measurement launches (host times each enqueue).
+comptime ATTN_PHASE_QK = 1
+comptime ATTN_PHASE_SOFTMAX = 2
+comptime ATTN_PHASE_PV = 4
+comptime ATTN_PHASE_ALL = 7
+
+
+def attention_kernel_parallel[
+    head_dim: Int, group: Int, NUM_WARPS: Int = ATTN_NUM_WARPS
+](
+    out_ptr: UnsafePointer[Scalar[BF16], MutAnyOrigin],
+    q_ptr: UnsafePointer[Scalar[BF16], ImmutAnyOrigin],
+    k_ptr: UnsafePointer[Scalar[BF16], ImmutAnyOrigin],
+    v_ptr: UnsafePointer[Scalar[BF16], ImmutAnyOrigin],
+    n_heads: Int,
+    n_kv_heads: Int,
+    seq: Int,
+    past: Int,
+    scale: Float32,
+    phases: Int,
+):
+    """Parallel softmax + PV stopgap (ATTN-STOPGAP). QK identical to serial.
+
+    Softmax: block max/sum over scores (reduction-order differs on sum only).
+    PV: NT-way column-parallel, serial key order → bit-identical to serial PV
+    given the same normalized scores (incl. BF16 prob round-trip).
+    """
+    comptime NT = WARP * NUM_WARPS
+    var head = Int(block_idx.x)
+    var tok = Int(block_idx.y)
+    if head >= n_heads or tok >= seq:
+        return
+    var kv_head = head // group
+    var tid = Int(thread_idx.x)
+    var lane = tid % WARP
+    var warp_id = tid // WARP
+
+    var scores = stack_allocation[
+        MAX_KEYS, F32, address_space = AddressSpace.SHARED
+    ]()
+    var q_sh = stack_allocation[
+        head_dim, F32, address_space = AddressSpace.SHARED
+    ]()
+    var red = stack_allocation[
+        NUM_WARPS, F32, address_space = AddressSpace.SHARED
+    ]()
+
+    # --- Phase 0: load Q (UNCHANGED from serial — scale applied after QK) ---
+    var q_base = (tok * n_heads + head) * head_dim
+    var d = tid
+    while d < head_dim:
+        q_sh[d] = q_ptr[q_base + d].cast[F32]()
+        d += NT
+    barrier()
+
+    var n_keys = past + tok + 1
+
+    # --- Phase 1: QK (UNCHANGED — same multi-warp warp-reduce as serial) ---
+    if (phases & ATTN_PHASE_QK) != 0:
+        var j = warp_id
+        while j < n_keys:
+            var k_base = (j * n_kv_heads + kv_head) * head_dim
+            var partial = Float32(0)
+            var dd = lane
+            while dd < head_dim:
+                partial += q_sh[dd] * k_ptr[k_base + dd].cast[F32]()
+                dd += WARP
+            var off = WARP // 2
+            while off > 0:
+                partial += shuffle_down(partial, UInt32(off))
+                off //= 2
+            if lane == 0:
+                scores[j] = partial * scale
+            j += NUM_WARPS
+        barrier()
+
+    # --- Phase 2: parallel softmax (block max / exp+sum / normalize) ------
+    if (phases & ATTN_PHASE_SOFTMAX) != 0:
+        # 2a. block max
+        var lmax = Float32(-3.4e38)
+        var jm = tid
+        while jm < n_keys:
+            lmax = max(lmax, scores[jm])
+            jm += NT
+        var offm = WARP // 2
+        while offm > 0:
+            lmax = max(lmax, shuffle_down(lmax, UInt32(offm)))
+            offm //= 2
+        if lane == 0:
+            red[warp_id] = lmax
+        barrier()
+        if warp_id == 0:
+            var wmax = Float32(-3.4e38)
+            if lane < NUM_WARPS:
+                wmax = red[lane]
+            var om = 2
+            while om > 0:
+                wmax = max(wmax, shuffle_down(wmax, UInt32(om)))
+                om //= 2
+            if lane == 0:
+                red[0] = wmax
+        barrier()
+        var m = red[0]
+
+        # 2b. exp + block sum (overwrite scores with unnormalized exp)
+        var lsum = Float32(0)
+        var je = tid
+        while je < n_keys:
+            var e = exp(scores[je] - m)
+            scores[je] = e
+            lsum += e
+            je += NT
+        var offs = WARP // 2
+        while offs > 0:
+            lsum = lsum + shuffle_down(lsum, UInt32(offs))
+            offs //= 2
+        if lane == 0:
+            red[warp_id] = lsum
+        barrier()
+        if warp_id == 0:
+            var wsum = Float32(0)
+            if lane < NUM_WARPS:
+                wsum = red[lane]
+            var os = 2
+            while os > 0:
+                wsum = wsum + shuffle_down(wsum, UInt32(os))
+                os //= 2
+            if lane == 0:
+                red[0] = wsum
+        barrier()
+        var inv_s = Float32(1.0) / red[0]
+
+        # 2c. normalize + BF16 round-trip (match serial for PV bit-identity)
+        var jn = tid
+        while jn < n_keys:
+            scores[jn] = (scores[jn] * inv_s).cast[BF16]().cast[F32]()
+            jn += NT
+        barrier()
+
+    # --- Phase 3: parallel PV (column-parallel, serial key order) ---------
+    if (phases & ATTN_PHASE_PV) != 0:
+        var o_base = (tok * n_heads + head) * head_dim
+        var od = tid
+        while od < head_dim:
+            var acc = Float32(0)
+            for jj in range(n_keys):
+                var v_base = (jj * n_kv_heads + kv_head) * head_dim
+                acc += scores[jj] * v_ptr[v_base + od].cast[F32]()
+            out_ptr[o_base + od] = acc.cast[BF16]()
+            od += NT
+
+
 def attention[
     head_dim: Int, group: Int
 ](
@@ -490,23 +642,47 @@ def attention[
     seq: Int,
     past: Int,
     ctx: DeviceContext,
+    *,
+    parallel: Bool = True,
+    phases: Int = ATTN_PHASE_ALL,
 ) raises:
+    """Attention dispatch. Default: parallel softmax+PV stopgap.
+
+    parallel=False uses the original single-lane softmax / single-warp PV
+    (validation reference). phases masks QK/SOFTMAX/PV for sub-split timing.
+    """
     if past + seq > MAX_KEYS:
         raise Error("sequence exceeds MAX_KEYS")
     var scale = Float32(1.0) / sqrt(Float32(head_dim))
-    ctx.enqueue_function[attention_kernel[head_dim, group]](
-        out_ptr,
-        q_ptr,
-        k_ptr,
-        v_ptr,
-        n_heads,
-        n_kv_heads,
-        seq,
-        past,
-        scale,
-        grid_dim=(n_heads, seq),
-        block_dim=(WARP * ATTN_NUM_WARPS,),
-    )
+    if parallel:
+        ctx.enqueue_function[attention_kernel_parallel[head_dim, group]](
+            out_ptr,
+            q_ptr,
+            k_ptr,
+            v_ptr,
+            n_heads,
+            n_kv_heads,
+            seq,
+            past,
+            scale,
+            phases,
+            grid_dim=(n_heads, seq),
+            block_dim=(WARP * ATTN_NUM_WARPS,),
+        )
+    else:
+        ctx.enqueue_function[attention_kernel[head_dim, group]](
+            out_ptr,
+            q_ptr,
+            k_ptr,
+            v_ptr,
+            n_heads,
+            n_kv_heads,
+            seq,
+            past,
+            scale,
+            grid_dim=(n_heads, seq),
+            block_dim=(WARP * ATTN_NUM_WARPS,),
+        )
 
 
 # ===----------------------------------------------------------------------=== #
