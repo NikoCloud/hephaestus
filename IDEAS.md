@@ -14,3 +14,4 @@
 | 2026-07-12 | Hand-write RDNA4 WMMA inline asm if upstream stalls (v_wmma_f32_16x16x16_bf16) | Phase 1b | ✅ |
 | 2026-07-12 | Launch-overhead profiling + QK-norm fusion: high-value once batching arrives and reduction-order sensitivity matters less | Phase 2 | ✅ |
 | 2026-07-13 | Further attention parallelism (more warps; splitting the weighted-V-sum across warps, which needs a combine step and would touch reduction order) | Phase 2 | ✅ |
+| 2026-07-13 | Upstream / configure MAX AsyncRT VRAM pool size (first-buffer ~90% card reservation on R9700) | Phase 2 | ✅ |

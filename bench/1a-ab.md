@@ -1,16 +1,43 @@
 # Phase 1a Closeout — A/B Benchmark: Hephaestus (BF16) vs llama.cpp (F16)
-## Date: 2026-07-13
+## Date: 2026-07-13 (post-fix re-measure same day)
 ## Hardware: GPU 0 = AMD Radeon AI PRO R9700 32GB (gfx1201), see `bench/hardware.md`
 ## Model: Qwen3-4B-Instruct-2507 (Hephaestus: BF16 safetensors; llama.cpp: F16 GGUF, 7.49 GiB)
 ## llama.cpp build: 33ca0dcb9 (9906), ROCm/HIP backend — same build as `bench/0-baseline-llamacpp-f16.md`
 
-GPU 0 checked idle (`rocm-smi`, 0% util) before every run below. GPU 1 never
-touched — llama.cpp binaries pinned to GPU 0 only via `-dev ROCm0` /
-`HIP_VISIBLE_DEVICES=0` (verified: GPU 1 stayed at 0% util throughout).
+GPU 0 checked idle before every run. GPU 1 never touched
+(`HIP_VISIBLE_DEVICES=0` / `-dev ROCm0`).
+
+**Post-fix drivers (this re-measure):** GPU `argmax_logits` (Finding 2
+RESOLVED) + chunked `load_arena` (cleaner host path; VRAM unchanged —
+Finding 3 CHARACTERIZED as MAX runtime pool). Commit `0b9ee04`.
 
 ---
 
-## Result table
+## Result table — POST-FIX (GPU argmax + chunked loader)
+
+| Metric | Hephaestus BF16 | llama.cpp F16 | Ratio (Heph/llama) |
+|---|---|---|---|
+| Prefill tok/s (10-token prompt) | 94.78 ± 0.93 | 147.61 ± 1.71 | 0.64× |
+| Prefill tok/s (512-token prompt) | 121.20 ± 0.29 | 1429.81 ± 11.00 (`llama-bench` pp512) | 0.08× |
+| TTFT ms (10-token prompt, forward only) | 105.52 ± 1.05 | 67.75 ± 0.78 | 1.56× (slower) |
+| TTFT ms (512-token prompt, forward only) | 4224.43 ± 10.18 | (not re-measured; was ~395) | — |
+| Decode tok/s (forward-pass only — G1a-2 metric) | 53.67 ± 0.18 | 61.96 ± 0.09 (`llama-bench` tg256) | 0.87× |
+| **Decode tok/s (incl. sampling)** | **52.80 ± 0.19** | **61.82 ± 0.08** (`llama-simple` eval) | **0.85×** |
+| Argmax / sample ms per decode step | **0.30 ± 0.01** | ~0.064 | ~4.7× (still, but was 800×) |
+| **Total time s (256 tokens, 10-token prompt)** | **4.94 ± 0.02** | **5.17 ± 0.01** | **0.96×** |
+| Peak VRAM MB | **~29,562** (runtime pool) | ~8,142 (model-sized) | 3.63× |
+| VRAM after exit MB | ~74.7 (baseline) | ~74.7 (baseline) | 1.0× (both clean) |
+
+**Headline:** total wall time **18.00s → 4.94s** (GPU argmax). End-to-end
+decode with sampling **14.3 → 52.8 tok/s**. Peak VRAM still ~29.6GB —
+expected: MAX/AsyncRT reserves ~90% of card on first `createBuffer` (see
+Finding 3).
+
+---
+
+## Result table — PRE-FIX (CPU argmax, full-blob loader) — 2026-07-13 earlier
+
+Kept for comparison. Do not use as current status.
 
 | Metric | Hephaestus BF16 | llama.cpp F16 | Ratio (Heph/llama) |
 |---|---|---|---|
@@ -19,15 +46,9 @@ touched — llama.cpp binaries pinned to GPU 0 only via `-dev ROCm0` /
 | TTFT ms (10-token prompt) | 152.61 ± 2.32 | 67.32 ± 0.77 | 2.27× (slower) |
 | TTFT ms (512-token prompt) | 4204.31 ± 88.86 | 394.63 ± 0.93 | 10.66× (slower) |
 | Decode tok/s (forward-pass only — the G1a-2 metric) | 54.39 ± 0.02 | 61.82 ± 0.11 | 0.88× |
-| Total time s (256 tokens, 10-token prompt) | 18.00 ± 0.00 | 5.19 ± 0.01 | 3.47× (slower) |
+| Total time s (256 tokens, 10-token prompt) | **18.00 ± 0.00** | 5.19 ± 0.01 | 3.47× (slower) |
 | Peak VRAM MB | ~29,590 | ~8,142 | 3.63× |
 | VRAM after exit MB | ~74.7 (baseline) | ~74.7 (baseline) | 1.0× (both clean) |
-
-**Three findings below change how this table should be read. Do not take the
-"Decode tok/s" ratio (0.88×) as contradicting G1a-2's PASS — it doesn't, but
-it isn't the same number as the 98.3%/109.2% cited there either. All three
-are measured, not estimated, and none of them were touched to make a number
-look better.**
 
 ---
 
@@ -65,69 +86,60 @@ hardware between two measurement dates is worth Niko's awareness — it may
 warrant re-baselining the target, or at minimum re-measuring the 55.14
 citation before it's cited again without a date-scoped caveat.
 
-## Finding 2: Hephaestus's own sampling step costs ~51.6ms/token — 3× its
-## own forward pass, and ~800× llama.cpp's equivalent cost
+## Finding 2: Sampling argmax cost — **RESOLVED** (GPU `argmax_logits`)
 
-Every "decode tok/s" figure quoted for Hephaestus throughout Phase 1a
-(11.60 → 47.98 → 49.13 → 54.22 → 54.35) measured **only the GPU forward
-pass** (`ctx.synchronize()` bracketing `forward()`), explicitly excluding
-the host-side argmax scan that picks the next token. That was the right
-methodology for isolating and fixing the model-compute bottleneck (G1a-2's
-actual target), but it means "decode tok/s" was never a real end-to-end
-number, and the gap shows up starkly in **Total time**, which this A/B
-exercise asked for and which does include it.
+### Pre-fix (discovery)
 
-Instrumented directly (`src/qwen_ab_bench.mojo`, timing bracketed
-separately around the forward pass and around the host-side
-`map_to_host()` + linear 151,936-element argmax scan):
+Every Phase 1a "decode tok/s" figure measured **forward only**, excluding
+host-side argmax. Instrumented A/B found:
 
-| | Hephaestus | llama.cpp (`llama-simple`, real `llama_sampler_init_greedy()`) |
+| | Hephaestus (CPU argmax) | llama.cpp |
 |---|---|---|
-| forward-pass-only decode | 54.39 tok/s (18.4 ms/token) | 61.82 tok/s (16.2 ms/token) |
-| **sampling cost per token** | **51.6 ms** | **0.065 ms** (`llama_perf_sampler_print`) |
-| decode incl. real sampling | **14.29 tok/s** | **61.72–61.94 tok/s** (sampling is noise) |
+| forward-pass-only decode | 54.39 tok/s (18.4 ms/token) | 61.82 tok/s |
+| **sampling cost per token** | **51.6 ms** | **0.065 ms** |
+| decode incl. sampling | **14.29 tok/s** | ~61.8 tok/s |
+| Total time (256 gen, short prompt) | **18.00 s** | 5.19 s |
 
-llama.cpp's sampler adds essentially nothing to its own decode time (0.065ms
-vs 16.2ms forward pass — 0.4%). Hephaestus's naive CPU argmax scan over the
-full BF16→F32-cast 151,936-element vocab, once per token, costs **more than
-the entire forward pass it follows**. This is why Total time (256 tokens,
-10-token prompt) is 18.00s for Hephaestus vs 5.19s for llama.cpp — a 3.47×
-gap that has nothing to do with the model-compute work G1a-2 measured, and
-everything to do with an unoptimized sampling step that was never in scope
-for G1a-2 (SPEC.md: "Greedy sampling only" was a scope statement about
-*what* sampling to do, not a performance target for it).
+### Fix
 
-**Not fixed here** — this is a discovery, not a task I was asked to do, and
-SPEC.md's scope law says work should move the current gate, not expand
-sideways into a newly-found one. Flagging for a decision: this is a real,
-large, fixable inefficiency (the interface report already names a vendored
-`nn.argmaxmin_gpu` kernel that would move the argmax onto the GPU and
-plausibly collapse most of this 51.6ms), but it's outside what was asked
-this session.
+Custom GPU `argmax_logits` in `src/hephaestus/kernels.mojo` (not vendored
+`nn.argmaxmin_gpu` — probe showed it returns the **higher** index on exact
+ties; torch/HF need **lowest**). Wired into generate / teacher-forced-decode /
+ab_bench / tiny_generate. Correctness: tiny token-exact; decode-path
+teacher-forced **255/254/252** vs oracle (unchanged).
 
-## Finding 3: Hephaestus's peak VRAM (~29.6GB) is far above the model's
-## actual size — attributable to the loader's own verification design, not
-## a leak
+### Post-fix
 
-Model is 8.04GB in BF16. Hephaestus's peak VRAM during a run is **~29.6GB**,
-vs llama.cpp's **~8.1GB** for the identical model (matching its 7.49GB F16
-size plus a small compute buffer, `~301MB` for the 512-token case per
-`llama_context`'s own reported buffer sizes). The gap traces to
-`hephaestus.loader.load_arena`'s round-trip correctness check (`DECISIONS.md`
-2026-07-12): it stages the 8GB weight blob into a pinned HostBuffer, copies
-to an 8GB DeviceBuffer arena, then copies **back** to a second HostBuffer to
-byte-compare — three ~8GB buffers alive at once by design, since "GPU copies
-fail silently" was the reason that check exists in the first place. **This
-is not a leak**: VRAM returns to baseline (~74.7MB, matching llama.cpp's own
-post-exit baseline) within ~2 seconds of process exit, confirmed by
-polling — the first check immediately on exit can catch a transient
-higher reading before the driver reclaims memory, so wait briefly before
-trusting a "VRAM after exit" number close to process termination.
+| | value |
+|---|---|
+| argmax ms/step | **0.30 ± 0.01** (~**170×** vs 51.6 ms) |
+| decode incl. sampling | **52.80 ± 0.19** tok/s |
+| Total time (256 gen, short) | **4.94 ± 0.02 s** (was 18.00) |
 
-Whether the round-trip verification buffer should be freed immediately
-after the check (rather than living for the arena's whole lifetime) is a
-memory-budget question relevant to Phase 2 (concurrent requests will each
-want their own arena), not something changed here.
+## Finding 3: Peak VRAM ~29.6GB — **CHARACTERIZED** (MAX runtime pool, not loader)
+
+### Pre-fix hypothesis (wrong)
+
+Attributed ~29.6GB peak to the loader holding three ~8GB host/device
+buffers for full-blob round-trip verify.
+
+### What was actually measured
+
+`experiments/vram_isolate_probe{,2}.mojo`:
+
+- `DeviceContext()` alone ≈ **270 MB**
+- First `enqueue_create_buffer` of **any** size (including tiny) triggers
+  ≈ **29.56 GB** reservation (~90% of R9700’s 32.6 GB)
+- Happens inside closed `AsyncRT_DeviceContext_createBuffer_async` — no
+  app-visible knob / env var found
+
+Chunked loader rewrite (128 MB stream + per-chunk byte-for-byte device
+verify) is a **better design** (stronger check, less host RAM) but **does
+not change peak VRAM** — the pool is independent of loader staging.
+
+**Not a leak:** VRAM returns to ~75 MB baseline after process exit.
+**Not app-fixable** from Hephaestus today. Logged to `IDEAS.md` as Phase
+2/3 (upstream pool-size control).
 
 ---
 
@@ -153,17 +165,16 @@ python3 scripts/prepare_ab_prompts.py
 ### Hephaestus
 
 ```
-pixi run mojo build -I ~/projects/modular/max/kernels/src -I src src/qwen_ab_bench.mojo -o /tmp/qwen_ab_bench2
-/tmp/qwen_ab_bench2 bench/ab_prompt_short_ids.txt 256   # 3 reps
-/tmp/qwen_ab_bench2 bench/ab_prompt_long_ids.txt 8      # 3 reps (8, not 256 -- prefill dominates
-                                                         #  the long-prompt case; full 256-decode not
-                                                         #  needed to get stable prefill/TTFT numbers)
+# Post-fix re-measure (or manual):
+sh scripts/run_ab_post_fix.sh
+# equivalent:
+pixi run mojo build -I ~/projects/modular/max/kernels/src -I src src/qwen_ab_bench.mojo -o /tmp/qwen_ab_bench
+/tmp/qwen_ab_bench bench/ab_prompt_short_ids.txt 256   # 3 reps
+/tmp/qwen_ab_bench bench/ab_prompt_long_ids.txt 8      # 3 reps
 ```
 
-`src/qwen_ab_bench.mojo` mirrors the production `forward()` call sequence
-exactly (same binary path as `qwen_generate.mojo`) with `perf_counter_ns`
-brackets around (a) the forward pass and (b) the host-side argmax
-separately, reported both ways per Finding 2.
+`src/qwen_ab_bench.mojo` mirrors production `forward()` with separate
+timers for (a) forward pass and (b) GPU argmax (was host scan pre-fix).
 
 ### llama.cpp
 
