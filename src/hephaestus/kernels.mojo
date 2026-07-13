@@ -13,17 +13,19 @@
 # hephaestus-wmma-nightly env.
 # ===----------------------------------------------------------------------=== #
 
-from std.gpu import barrier, block_dim, block_idx, thread_idx
+from std.gpu import WARP_SIZE, barrier, block_dim, block_idx, thread_idx
+from std.gpu.host import DeviceBuffer, DeviceContext, get_gpu_target
 from std.gpu.memory import AddressSpace
+from std.gpu.primitives.grid_controls import PDLLevel, pdl_launch_attributes
 from std.gpu.primitives.warp import shuffle_down
-from std.math import ceildiv, cos, exp, sin, sqrt
+from std.math import align_up, ceildiv, cos, exp, sin, sqrt
 from std.memory import stack_allocation
-
-from std.gpu.host import DeviceBuffer, DeviceContext
+from std.sys import simd_width_of
 from std.utils.index import Index, IndexList
+
 from layout import Coord, TileTensor
 from layout.tile_layout import row_major
-from linalg.gemv import gemv_gpu
+from linalg.gemv import gemv_gpu, gemv_kernel_vector
 from linalg.matmul.gpu import matmul_kernel_naive
 
 from hephaestus.wmma_gfx12 import WMMA_TILE, wmma_gemm_bf16
@@ -108,6 +110,184 @@ def linear(
         return
 
     _linear_naive(c, a, b, m, n, k, ctx)
+
+
+# ===----------------------------------------------------------------------=== #
+# FP8 E4M3 GEMV (decode M=1): y[n] = scale[n] * sum_k fp8(W[n,k]) * bf16(x[k])
+# Weights stay FP8 in VRAM. Pattern follows MAX gemv_split_k for AMD (vectorized
+# K-strip, multi-row tile_n, non-temporal weight loads, warp+block reduce) but
+# with proper FP8→F32 cast (vendored split_k rebinds weight bits to a_type and
+# is unsafe for mixed BF16 acts + FP8 weights).
+# ===----------------------------------------------------------------------=== #
+
+comptime FP8 = DType.float8_e4m3fn
+
+
+def gemv_fp8[
+    c_type: DType, add_residual: Bool = False
+](
+    c: TileTensor[mut=True, dtype=c_type, ...],
+    a: TileTensor[mut=False, dtype=BF16, ...],
+    w: TileTensor[mut=False, dtype=FP8, ...],
+    scale: TileTensor[mut=False, dtype=F32, ...],
+    n: Int,
+    k: Int,
+    ctx: DeviceContext,
+) raises:
+    """C[n] = scale[n] * (W[n,:] · a[0,:])  with W FP8 E4M3, a BF16.
+    If add_residual, C += that product (in-place).
+
+    Uses MAX gemv_kernel_vector with FP8 simd_width + scale epilogue + PDL.
+    Vendored gemv_gpu split-K rebinds weight bits to a_type (unsafe for mixed
+    BF16 acts + FP8 weights). Weights/scales mut=False for exclusivity.
+    """
+    var c_ptr = c.ptr.as_unsafe_any_origin()
+    var s_ptr = scale.ptr.as_unsafe_any_origin()
+
+    @always_inline
+    @__copy_capture(c_ptr, s_ptr)
+    @parameter
+    def epilogue[
+        dtype: DType, width: SIMDSize, *, alignment: Int = 1
+    ](idx: IndexList[2], val: SIMD[dtype, width]) -> None:
+        var col = idx[1]
+        var v = val[0].cast[F32]() * s_ptr[col]
+        comptime if add_residual:
+            v = v + c_ptr[col].cast[F32]()
+        c_ptr[col] = v.cast[c_type]()
+
+    comptime sw = simd_width_of[FP8, target=get_gpu_target()]()
+    comptime WARPS_PER_BLOCK = 1024 // WARP_SIZE
+    comptime pdl = PDLLevel.ON
+    var block_dim = min(
+        align_up(k // sw, WARP_SIZE),
+        WARP_SIZE * WARPS_PER_BLOCK,
+    )
+    if block_dim < WARP_SIZE:
+        block_dim = WARP_SIZE
+    comptime kernel = gemv_kernel_vector[
+        c_type,
+        FP8,
+        BF16,
+        type_of(c).LayoutType,
+        type_of(w).LayoutType,
+        type_of(a).LayoutType,
+        type_of(c).Storage,
+        type_of(w).Storage,
+        type_of(a).Storage,
+        simd_width=sw,
+        transpose_b=True,
+        elementwise_lambda_fn=epilogue,
+        check_bounds=True,
+        pdl_level=pdl,
+    ]
+    ctx.enqueue_function[kernel](
+        c,
+        w,
+        a,
+        n,
+        1,
+        k,
+        grid_dim=ceildiv(n, block_dim // WARP_SIZE),
+        block_dim=block_dim,
+        attributes=pdl_launch_attributes(pdl),
+    )
+
+
+def linear_fp8[
+    c_type: DType
+](
+    c: TileTensor[mut=True, dtype=c_type, ...],
+    a: TileTensor[mut=False, dtype=BF16, ...],
+    w: TileTensor[mut=False, dtype=FP8, ...],
+    scale: TileTensor[mut=False, dtype=F32, ...],
+    m: Int,
+    n: Int,
+    k: Int,
+    ctx: DeviceContext,
+) raises:
+    """C = A @ W^T with FP8 weights + per-channel F32 scale.
+    Decode (m=1) uses gemv_fp8. Prefill (m>1) loops gemv over rows (correct,
+    not the prefill performance path)."""
+    if m == 1:
+        gemv_fp8[c_type, False](c, a, w, scale, n, k, ctx)
+        return
+    # Row-at-a-time gemv for short prefill correctness only (not perf path).
+    for row in range(m):
+        var a_row = TileTensor(
+            ptr=a.ptr + row * k, layout=row_major(Coord(Index(1, k)))
+        )
+        var c_row = TileTensor(
+            ptr=c.ptr + row * n, layout=row_major(Coord(Index(1, n)))
+        )
+        gemv_fp8[c_type, False](c_row, a_row, w, scale, n, k, ctx)
+
+
+def linear_add_residual_fp8(
+    residual: TileTensor[mut=True, dtype=BF16, ...],
+    a: TileTensor[mut=False, dtype=BF16, ...],
+    w: TileTensor[mut=False, dtype=FP8, ...],
+    scale: TileTensor[mut=False, dtype=F32, ...],
+    m: Int,
+    n: Int,
+    k: Int,
+    ctx: DeviceContext,
+) raises:
+    """residual += A @ W^T (FP8 weights)."""
+    if m == 1:
+        gemv_fp8[BF16, True](residual, a, w, scale, n, k, ctx)
+        return
+    for row in range(m):
+        var a_row = TileTensor(
+            ptr=a.ptr + row * k, layout=row_major(Coord(Index(1, k)))
+        )
+        var r_row = TileTensor(
+            ptr=residual.ptr + row * n, layout=row_major(Coord(Index(1, n)))
+        )
+        gemv_fp8[BF16, True](r_row, a_row, w, scale, n, k, ctx)
+
+
+def embed_fp8_kernel(
+    out_ptr: UnsafePointer[Scalar[BF16], MutAnyOrigin],
+    emb_ptr: UnsafePointer[Scalar[FP8], ImmutAnyOrigin],
+    scale_ptr: UnsafePointer[Scalar[F32], ImmutAnyOrigin],
+    ids_ptr: UnsafePointer[Scalar[DType.int32], ImmutAnyOrigin],
+    seq: Int,
+    hidden: Int,
+):
+    """out[t,d] = scale[id[t]] * fp8_to_f32(embed[id[t], d])."""
+    var tid = Int(block_idx.x * block_dim.x + thread_idx.x)
+    var total = seq * hidden
+    if tid >= total:
+        return
+    var t = tid // hidden
+    var d = tid % hidden
+    var tok = Int(ids_ptr[t])
+    var s = scale_ptr[tok]
+    var v = emb_ptr[tok * hidden + d].cast[F32]()
+    out_ptr[t * hidden + d] = (s * v).cast[BF16]()
+
+
+def embed_lookup_fp8(
+    dst: TileTensor[mut=True, dtype=BF16, ...],
+    emb: TileTensor[mut=False, dtype=FP8, ...],
+    scale: TileTensor[mut=False, dtype=F32, ...],
+    ids: DeviceBuffer[DType.int32],
+    seq: Int,
+    hidden: Int,
+    ctx: DeviceContext,
+) raises:
+    comptime TPB = 256
+    ctx.enqueue_function[embed_fp8_kernel](
+        dst.ptr.as_unsafe_any_origin(),
+        emb.ptr.as_unsafe_any_origin(),
+        scale.ptr.as_unsafe_any_origin(),
+        ids.unsafe_ptr().as_immutable().as_unsafe_any_origin(),
+        seq,
+        hidden,
+        grid_dim=(ceildiv(seq * hidden, TPB),),
+        block_dim=(TPB,),
+    )
 
 
 def linear_add_residual(

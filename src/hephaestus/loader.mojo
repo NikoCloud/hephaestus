@@ -14,6 +14,7 @@ from std.gpu.host import DeviceBuffer, DeviceContext, HostBuffer
 from std.memory import Span
 
 from hephaestus.model import LayerOffsets, Qwen3Weights
+from hephaestus.model_fp8 import LayerOffsetsFP8, Qwen3WeightsFP8
 
 
 @fieldwise_init
@@ -275,5 +276,240 @@ def build_weights[
         base_ptr,
         off_embed=_element_offset(arena, "model.embed_tokens.weight"),
         off_output_norm=_element_offset(arena, "model.norm.weight"),
+        layer_offsets=layer_offsets,
+    )
+
+
+# ===----------------------------------------------------------------------=== #
+# Mixed-dtype arena (FP8 E4M3 weights + F32 scales + BF16 norms)
+# ===----------------------------------------------------------------------=== #
+
+
+@fieldwise_init
+struct WeightArenaBytes(Movable):
+    """Byte-addressed device arena for mixed-dtype staged blobs."""
+
+    var buf: DeviceBuffer[DType.uint8]
+    var entries: List[TensorEntry]
+    var index: Dict[String, Int]
+    var total_bytes: Int
+
+
+comptime LOAD_CHUNK_BYTES = 128 * 1024 * 1024  # 128MB
+
+
+def _dtype_width(dtype: String) raises -> Int:
+    if dtype == "BF16":
+        return 2
+    if dtype == "F32":
+        return 4
+    if dtype == "F8_E4M3" or dtype == "F8E4M3":
+        return 1
+    raise Error("unknown dtype tag: " + dtype)
+
+
+def load_arena_bytes(ctx: DeviceContext, prefix: String) raises -> WeightArenaBytes:
+    """Load mixed-dtype staged blob into a uint8 device arena."""
+    var entries = parse_offsets(prefix + ".offsets")
+    var index = Dict[String, Int]()
+    var total_bytes = 0
+    for i in range(len(entries)):
+        index[entries[i].name] = i
+        total_bytes += entries[i].byte_size
+
+    var dev = ctx.enqueue_create_buffer[DType.uint8](total_bytes)
+    var chunk = min(LOAD_CHUNK_BYTES, total_bytes)
+    if chunk == 0:
+        chunk = 1
+    var host_chunk = ctx.enqueue_create_host_buffer[DType.uint8](chunk)
+    var back_chunk = ctx.enqueue_create_host_buffer[DType.uint8](chunk)
+    ctx.synchronize()
+
+    var f = open(prefix + ".weights", "r")
+    var dev_ptr = dev.unsafe_ptr()
+    var done = 0
+    while done < total_bytes:
+        var this_chunk = min(chunk, total_bytes - done)
+        var byte_ptr = host_chunk.unsafe_ptr()
+        var chunk_read = 0
+        while chunk_read < this_chunk:
+            var n = f.read(
+                Span[Scalar[DType.uint8]](
+                    ptr=byte_ptr + chunk_read, length=this_chunk - chunk_read
+                )
+            )
+            if n <= 0:
+                raise Error("weights truncated at byte " + String(done + chunk_read))
+            chunk_read += n
+        ctx.enqueue_copy(dev_ptr + done, host_chunk.unsafe_ptr(), this_chunk)
+        ctx.synchronize()
+        ctx.enqueue_copy(back_chunk.unsafe_ptr(), dev_ptr + done, this_chunk)
+        ctx.synchronize()
+        var back = back_chunk.unsafe_ptr()
+        for i in range(this_chunk):
+            if byte_ptr[i] != back[i]:
+                raise Error("round-trip mismatch at byte " + String(done + i))
+        done += this_chunk
+    f.close()
+    return WeightArenaBytes(
+        buf=dev^, entries=entries^, index=index^, total_bytes=total_bytes
+    )
+
+
+def _byte_offset(arena: WeightArenaBytes, name: String) raises -> Int:
+    if name not in arena.index:
+        raise Error("missing tensor: " + name)
+    return arena.entries[arena.index[name]].byte_offset
+
+
+def _require(
+    arena: WeightArenaBytes,
+    name: String,
+    dtype: String,
+    rank: Int,
+    d0: Int,
+    d1: Int = -1,
+) raises:
+    if name not in arena.index:
+        raise Error("missing tensor: " + name)
+    ref e = arena.entries[arena.index[name]]
+    if e.dtype != dtype:
+        raise Error(
+            "dtype mismatch " + name + ": got " + e.dtype + " want " + dtype
+        )
+    if len(e.shape) != rank:
+        raise Error("rank mismatch " + name)
+    if e.shape[0] != d0:
+        raise Error("shape[0] mismatch " + name)
+    if rank == 2 and e.shape[1] != d1:
+        raise Error("shape[1] mismatch " + name)
+    var elems = 1
+    for d in e.shape:
+        elems *= d
+    var width = _dtype_width(dtype)
+    if e.byte_size != elems * width:
+        raise Error("byte_size mismatch " + name)
+
+
+def verify_manifest_fp8[
+    vocab: Int,
+    hidden: Int,
+    q_out: Int,
+    kv_out: Int,
+    head_dim: Int,
+    inter: Int,
+    n_layers: Int,
+](entries: List[TensorEntry], index: Dict[String, Int]) raises:
+    """FP8 checkpoint: 253 F8 weights + 253 F32 scales + 145 BF16 norms (4B)."""
+    # Expected: 1 embed + 1 embed_scale + 1 norm + n_layers * (7 fp8 + 7 scale + 4 bf16)
+    # = 3 + n_layers * 18. For n_layers=36: 3+648=651.
+    var expected = 3 + 18 * n_layers
+    if len(entries) != expected:
+        raise Error(
+            "FP8 tensor count: expected "
+            + String(expected)
+            + ", got "
+            + String(len(entries))
+        )
+    if "lm_head.weight" in index:
+        raise Error("A2: lm_head.weight present; expected tied embeddings")
+    # Contiguous byte offsets + per-tensor size
+    var expected_offset = 0
+    for e in entries:
+        var width = _dtype_width(e.dtype)
+        var elems = 1
+        for d in e.shape:
+            elems *= d
+        if e.byte_size != elems * width:
+            raise Error("size mismatch: " + e.name)
+        if e.byte_offset != expected_offset:
+            raise Error("offset not contiguous at " + e.name)
+        expected_offset += e.byte_size
+    # Pairing: every F8 weight has matching _scale
+    for e in entries:
+        if e.dtype == "F8_E4M3" or e.dtype == "F8E4M3":
+            var sn = e.name + "_scale"
+            if sn not in index:
+                raise Error("missing scale for " + e.name)
+            ref s = entries[index[sn]]
+            if s.dtype != "F32":
+                raise Error("scale not F32: " + sn)
+            if len(s.shape) != 2 or s.shape[0] != e.shape[0] or s.shape[1] != 1:
+                raise Error("scale shape bad for " + sn)
+
+
+def build_weights_fp8[
+    origin: Origin[mut=True],
+    vocab: Int,
+    hidden: Int,
+    q_out: Int,
+    kv_out: Int,
+    head_dim: Int,
+    inter: Int,
+    n_layers: Int,
+](
+    base_ptr: UnsafePointer[Scalar[DType.uint8], origin],
+    arena: WeightArenaBytes,
+) raises -> Qwen3WeightsFP8[
+    origin, vocab, hidden, q_out, kv_out, head_dim, inter, n_layers
+]:
+    verify_manifest_fp8[
+        vocab, hidden, q_out, kv_out, head_dim, inter, n_layers
+    ](arena.entries, arena.index)
+
+    _require(arena, "model.embed_tokens.weight", "F8_E4M3", 2, vocab, hidden)
+    _require(arena, "model.embed_tokens.weight_scale", "F32", 2, vocab, 1)
+    _require(arena, "model.norm.weight", "BF16", 1, hidden)
+
+    var layer_offsets = List[LayerOffsetsFP8]()
+    for i in range(n_layers):
+        var p = "model.layers." + String(i) + "."
+        _require(arena, p + "input_layernorm.weight", "BF16", 1, hidden)
+        _require(arena, p + "self_attn.q_proj.weight", "F8_E4M3", 2, q_out, hidden)
+        _require(arena, p + "self_attn.q_proj.weight_scale", "F32", 2, q_out, 1)
+        _require(arena, p + "self_attn.k_proj.weight", "F8_E4M3", 2, kv_out, hidden)
+        _require(arena, p + "self_attn.k_proj.weight_scale", "F32", 2, kv_out, 1)
+        _require(arena, p + "self_attn.v_proj.weight", "F8_E4M3", 2, kv_out, hidden)
+        _require(arena, p + "self_attn.v_proj.weight_scale", "F32", 2, kv_out, 1)
+        _require(arena, p + "self_attn.o_proj.weight", "F8_E4M3", 2, hidden, q_out)
+        _require(arena, p + "self_attn.o_proj.weight_scale", "F32", 2, hidden, 1)
+        _require(arena, p + "self_attn.q_norm.weight", "BF16", 1, head_dim)
+        _require(arena, p + "self_attn.k_norm.weight", "BF16", 1, head_dim)
+        _require(arena, p + "post_attention_layernorm.weight", "BF16", 1, hidden)
+        _require(arena, p + "mlp.gate_proj.weight", "F8_E4M3", 2, inter, hidden)
+        _require(arena, p + "mlp.gate_proj.weight_scale", "F32", 2, inter, 1)
+        _require(arena, p + "mlp.up_proj.weight", "F8_E4M3", 2, inter, hidden)
+        _require(arena, p + "mlp.up_proj.weight_scale", "F32", 2, inter, 1)
+        _require(arena, p + "mlp.down_proj.weight", "F8_E4M3", 2, hidden, inter)
+        _require(arena, p + "mlp.down_proj.weight_scale", "F32", 2, hidden, 1)
+        layer_offsets.append(
+            LayerOffsetsFP8(
+                attn_norm=_byte_offset(arena, p + "input_layernorm.weight"),
+                q_proj=_byte_offset(arena, p + "self_attn.q_proj.weight"),
+                q_proj_scale=_byte_offset(arena, p + "self_attn.q_proj.weight_scale"),
+                k_proj=_byte_offset(arena, p + "self_attn.k_proj.weight"),
+                k_proj_scale=_byte_offset(arena, p + "self_attn.k_proj.weight_scale"),
+                v_proj=_byte_offset(arena, p + "self_attn.v_proj.weight"),
+                v_proj_scale=_byte_offset(arena, p + "self_attn.v_proj.weight_scale"),
+                o_proj=_byte_offset(arena, p + "self_attn.o_proj.weight"),
+                o_proj_scale=_byte_offset(arena, p + "self_attn.o_proj.weight_scale"),
+                q_norm=_byte_offset(arena, p + "self_attn.q_norm.weight"),
+                k_norm=_byte_offset(arena, p + "self_attn.k_norm.weight"),
+                ffn_norm=_byte_offset(arena, p + "post_attention_layernorm.weight"),
+                gate_proj=_byte_offset(arena, p + "mlp.gate_proj.weight"),
+                gate_proj_scale=_byte_offset(arena, p + "mlp.gate_proj.weight_scale"),
+                up_proj=_byte_offset(arena, p + "mlp.up_proj.weight"),
+                up_proj_scale=_byte_offset(arena, p + "mlp.up_proj.weight_scale"),
+                down_proj=_byte_offset(arena, p + "mlp.down_proj.weight"),
+                down_proj_scale=_byte_offset(arena, p + "mlp.down_proj.weight_scale"),
+            )
+        )
+    return Qwen3WeightsFP8[
+        origin, vocab, hidden, q_out, kv_out, head_dim, inter, n_layers
+    ](
+        base_ptr,
+        off_embed=_byte_offset(arena, "model.embed_tokens.weight"),
+        off_embed_scale=_byte_offset(arena, "model.embed_tokens.weight_scale"),
+        off_output_norm=_byte_offset(arena, "model.norm.weight"),
         layer_offsets=layer_offsets,
     )
