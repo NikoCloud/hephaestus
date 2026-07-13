@@ -435,7 +435,9 @@ def forward_dump[
                 catalog,
             )
 
-        linear_add_residual(x, attn_out, layer.o_proj, seq, hidden, q_out, ctx)
+        linear_add_residual(
+            x, attn_out, layer.o_proj, seq, hidden, q_out, ctx, use_wmma=use_wmma
+        )
         if do_dump:
             dump_bf16_device(
                 dump_dir,
@@ -518,7 +520,9 @@ def forward_dump[
                 catalog,
             )
 
-        linear_add_residual(x, act, layer.down_proj, seq, hidden, inter, ctx)
+        linear_add_residual(
+            x, act, layer.down_proj, seq, hidden, inter, ctx, use_wmma=use_wmma
+        )
         if do_dump:
             dump_bf16_device(
                 dump_dir,

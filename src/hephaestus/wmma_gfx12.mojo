@@ -207,6 +207,91 @@ def wmma_gemm_kernel[
 
 
 # ===----------------------------------------------------------------------=== #
+# Residual-fused store: residual += A @ W^T  (o_proj / down_proj)
+# Same LDS v2 body; epilogue is F32(residual) + acc → BF16 (in-place RMW).
+# ===----------------------------------------------------------------------=== #
+
+
+def wmma_gemm_kernel_residual(
+    a_ptr: UnsafePointer[Scalar[DType.bfloat16], ImmutAnyOrigin],
+    w_ptr: UnsafePointer[Scalar[DType.bfloat16], ImmutAnyOrigin],
+    residual_ptr: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
+    M: Int,
+    N: Int,
+    K: Int,
+):
+    """v2 LDS GEMM with fused residual-add store: residual[m,n] += (A@W^T)[m,n].
+
+    Read-modify-write on residual (BF16 → F32 add → BF16), matching the naive
+    linear_add_residual epilogue semantics after the full K accumulation.
+    """
+    var l = Int(thread_idx.x)
+    if l >= WMMA_LANES:
+        return
+
+    var n_tile = Int(block_idx.x)
+    var m_tile = Int(block_idx.y)
+    var MB = m_tile * WMMA_TILE
+    var NB = n_tile * WMMA_TILE
+
+    if MB >= M or NB >= N:
+        return
+
+    var row_or_col = l % WMMA_TILE
+    var half = l // WMMA_TILE
+
+    var A_lds = stack_allocation[
+        WMMA_TILE * LDS_STRIDE, DType.bfloat16, address_space = AddressSpace.SHARED
+    ]()
+    var B_lds = stack_allocation[
+        WMMA_TILE * LDS_STRIDE, DType.bfloat16, address_space = AddressSpace.SHARED
+    ]()
+
+    var acc = SIMD[DType.float32, WMMA_FRAG](0.0)
+
+    var ks = 0
+    while ks < K:
+        @parameter
+        for i in range(8):
+            var row = i * 2 + half
+            var col = row_or_col
+            var lds_idx = row * LDS_STRIDE + col
+            var g_row_a = MB + row
+            if g_row_a < M:
+                A_lds[lds_idx] = a_ptr[g_row_a * K + ks + col]
+            else:
+                A_lds[lds_idx] = Scalar[DType.bfloat16](0)
+            B_lds[lds_idx] = w_ptr[(NB + row) * K + ks + col]
+
+        barrier()
+
+        var a_bf16 = SIMD[DType.bfloat16, WMMA_FRAG](0)
+        var b_bf16 = SIMD[DType.bfloat16, WMMA_FRAG](0)
+        var frag_base = row_or_col * LDS_STRIDE + half * WMMA_FRAG
+        @parameter
+        for j in range(WMMA_FRAG):
+            a_bf16[j] = A_lds[frag_base + j]
+            b_bf16[j] = B_lds[frag_base + j]
+
+        var a_i16 = bitcast[DType.int16, WMMA_FRAG](a_bf16)
+        var b_i16 = bitcast[DType.int16, WMMA_FRAG](b_bf16)
+        acc = wmma_bf16(a_i16, b_i16, acc)
+
+        barrier()
+        ks += WMMA_TILE
+
+    # Fused residual-add epilogue (same cast order as naive epilogue).
+    @parameter
+    for j in range(WMMA_FRAG):
+        var m = MB + half * WMMA_FRAG + j
+        var n = NB + row_or_col
+        if m < M:
+            var idx = m * N + n
+            var old = residual_ptr[idx].cast[DType.float32]()
+            residual_ptr[idx] = (old + acc[j]).cast[DType.bfloat16]()
+
+
+# ===----------------------------------------------------------------------=== #
 # Host launchers
 # ===----------------------------------------------------------------------=== #
 
@@ -265,6 +350,42 @@ def wmma_gemm_bf16_v1[
         a.ptr.as_immutable().as_unsafe_any_origin(),
         b.ptr.as_immutable().as_unsafe_any_origin(),
         c.ptr.as_unsafe_any_origin(),
+        m,
+        n,
+        k,
+        grid_dim=(n_tiles, m_tiles),
+        block_dim=(WMMA_LANES,),
+    )
+
+
+def wmma_gemm_bf16_residual(
+    residual: TileTensor[mut=True, dtype = DType.bfloat16, ...],
+    a: TileTensor[DType.bfloat16, ...],
+    b: TileTensor[DType.bfloat16, ...],
+    m: Int,
+    n: Int,
+    k: Int,
+    ctx: DeviceContext,
+) raises:
+    """Host launch: residual += A[m,k] @ B[n,k]^T with fused BF16 residual store.
+
+    residual is both the addend and the destination (in-place RMW). Used by
+    linear_add_residual for o_proj / down_proj prefill (m>1).
+    """
+    debug_assert(m > 0, "wmma_gemm_bf16_residual: m must be > 0")
+    debug_assert(
+        n % WMMA_TILE == 0, "wmma_gemm_bf16_residual: n must be divisible by 16"
+    )
+    debug_assert(
+        k % WMMA_TILE == 0, "wmma_gemm_bf16_residual: k must be divisible by 16"
+    )
+
+    var n_tiles = n // WMMA_TILE
+    var m_tiles = ceildiv(m, WMMA_TILE)
+    ctx.enqueue_function[wmma_gemm_kernel_residual](
+        a.ptr.as_immutable().as_unsafe_any_origin(),
+        b.ptr.as_immutable().as_unsafe_any_origin(),
+        residual.ptr.as_unsafe_any_origin(),
         m,
         n,
         k,

@@ -26,7 +26,7 @@ from layout.tile_layout import row_major
 from linalg.gemv import gemv_gpu
 from linalg.matmul.gpu import matmul_kernel_naive
 
-from hephaestus.wmma_gfx12 import WMMA_TILE, wmma_gemm_bf16
+from hephaestus.wmma_gfx12 import WMMA_TILE, wmma_gemm_bf16, wmma_gemm_bf16_residual
 
 comptime BF16 = DType.bfloat16
 comptime F32 = DType.float32
@@ -118,15 +118,15 @@ def linear_add_residual(
     n: Int,
     k: Int,
     ctx: DeviceContext,
+    *,
+    use_wmma: Bool = True,
 ) raises:
-    """residual += A @ B^T, fused via the matmul kernels' elementwise epilogue
-    (G1a-2: removes a separate residual_add launch -- used for o_proj and
-    down_proj, the two projections immediately followed by a residual add).
+    """residual += A @ B^T. Used for o_proj and down_proj.
 
-    Every elementwise_lambda_fn call site in gemv.mojo and matmul_kernel_naive
-    invokes the epilogue with width=1 (one element at a time, no
-    vectorization in these paths) -- verified by reading every call site
-    before relying on it here.
+    Decode (m=1) → gemv_gpu with F32 residual epilogue (unchanged).
+    Prefill (m>1) → gfx12 BF16 WMMA with fused residual-add store when n,k
+    are tile-aligned; otherwise naive matmul + same epilogue.
+    Pass use_wmma=False to force the naive path (layer-diff harness).
     """
 
     @always_inline
@@ -145,6 +145,10 @@ def linear_add_residual(
         gemv_gpu[transpose_b=True, elementwise_lambda_fn=epilogue](
             residual, a, b, ctx
         )
+        return
+
+    if use_wmma and n % WMMA_TILE == 0 and k % WMMA_TILE == 0:
+        wmma_gemm_bf16_residual(residual, a, b, m, n, k, ctx)
         return
 
     comptime BLOCK_DIM = 16
