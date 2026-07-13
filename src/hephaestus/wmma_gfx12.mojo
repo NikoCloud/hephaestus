@@ -14,10 +14,11 @@
 # v3a: 64×64 / 4-wave / BK=16, LDS reuse intensity 32 (spec G1b-3a).
 #      A fragment hoisted out of sc loop (4× A reuse). Fused residual epilogue.
 #
-# VGPR/occupancy (v3a, gfx1201, nightly 2026071206):
-#   Design budget ~55 VGPR/lane (4×acc[8]f32=32 + a frag 4 + b frag 4 + addr ~15).
-#   LDS 4 KB/workgroup (non-binding vs 64 KB). Occupancy not measured this run
-#   (rocprof TBD); v3b (8 acc/wave, BN=256) should stay under the cliff if ≤~64.
+# VGPR/occupancy (v3a, gfx1201, nightly 2026071206) — from --emit asm metadata:
+#   Actual: 92 VGPR/lane, 0 spills; LDS 4096 B/wg; SGPR ~18–20.
+#   Design estimate was ~55; compiler uses more temps. Occupancy (theoretical):
+#   256 VGPR/SIMD → floor(256/96)≈2 waves/SIMD → ~8 waves/WGP → ~2 WGs of 4 waves.
+#   VGPR is the limiter (LDS would allow more). v3b (more acc) must watch this.
 #
 # Dispatch: M,N % 64 == 0 and K % 16 == 0 → v3a; else N,K % 16 → v2.
 # ===----------------------------------------------------------------------=== #
