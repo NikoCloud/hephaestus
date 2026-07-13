@@ -7,6 +7,7 @@
 from std.gpu.host import DeviceContext
 
 from hephaestus.forward import Activations, KVCache, forward
+from hephaestus.kernels import argmax_logits
 from hephaestus.loader import build_weights, load_arena, verify_manifest
 from hephaestus.model import Qwen3Weights
 
@@ -79,6 +80,9 @@ def generate(
         for i in range(seq):
             h[i] = ids[i]
 
+    var argmax_bf16 = ctx.enqueue_create_buffer[DType.bfloat16](VOCAB)
+    var argmax_idx = ctx.enqueue_create_buffer[DType.int32](1)
+
     var generated = List[Int32]()
     var cur_len = seq
 
@@ -98,20 +102,10 @@ def generate(
         ](weights, acts, cache, dev_ids, n, ctx)
         ctx.synchronize()
 
-        # Greedy argmax over the last position's logits.
-        var best = Int32(0)
-        var best_val = Float32(-3.4e38)
-        with acts.logits.map_to_host() as h:
-            var base = (n - 1) * VOCAB
-            for i in range(VOCAB):
-                # Greedy = argmax over the REFERENCE's logit dtype. HF's lm_head
-                # emits bf16, and torch.argmax returns the FIRST max, so ties
-                # break to the lower id. Comparing in fp32 resolves ties torch
-                # never saw and picks differently (prompt3 step7). Round first.
-                var val = h[base + i].cast[DType.bfloat16]().cast[DType.float32]()
-                if val > best_val:
-                    best_val = val
-                    best = Int32(i)
+        # Greedy argmax over the last position's logits (GPU, see
+        # hephaestus.kernels.argmax_logits).
+        var logits_base = acts.logits.unsafe_ptr() + (n - 1) * VOCAB
+        var best = argmax_logits(logits_base, argmax_bf16, argmax_idx, VOCAB, ctx)
         generated.append(best)
         cur_len += 1
 

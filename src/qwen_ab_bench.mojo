@@ -23,6 +23,7 @@ from hephaestus.constants import (
     VOCAB_SIZE,
 )
 from hephaestus.forward import Activations, KVCache, forward
+from hephaestus.kernels import argmax_logits
 from hephaestus.loader import build_weights, load_arena, verify_manifest
 
 
@@ -72,6 +73,9 @@ def main() raises:
         for i in range(seq):
             h[i] = ids[i]
 
+    var argmax_bf16 = ctx.enqueue_create_buffer[DType.bfloat16](VOCAB_SIZE)
+    var argmax_idx = ctx.enqueue_create_buffer[DType.int32](1)
+
     var t_prefill_ns = Int(0)
     var t_decode_ns = Int(0)
     var t_argmax_prefill_ns = Int(0)
@@ -97,15 +101,10 @@ def main() raises:
             decode_steps += 1
 
         var t_am0 = perf_counter_ns()
-        var best = Int32(0)
-        var best_val = Float32(-3.4e38)
-        with acts.logits.map_to_host() as h:
-            var base = (n - 1) * VOCAB_SIZE
-            for i in range(VOCAB_SIZE):
-                var val = h[base + i].cast[DType.bfloat16]().cast[DType.float32]()
-                if val > best_val:
-                    best_val = val
-                    best = Int32(i)
+        var logits_base = acts.logits.unsafe_ptr() + (n - 1) * VOCAB_SIZE
+        var best = argmax_logits(
+            logits_base, argmax_bf16, argmax_idx, VOCAB_SIZE, ctx
+        )
         with dev_ids.map_to_host() as h:
             h[0] = best
         var t_am1 = perf_counter_ns()
@@ -120,16 +119,16 @@ def main() raises:
     var total_s = Float64(t_run_end - t_run_start) / 1e9
     print("prompt_tokens:", seq)
     print("prefill_s (forward-pass only):", prefill_s)
-    print("prefill_s (incl. host argmax):", prefill_s + argmax_prefill_s)
+    print("prefill_s (incl. GPU argmax):", prefill_s + argmax_prefill_s)
     print("prefill_tok_s:", Float64(seq) / prefill_s)
     print("ttft_ms (forward-pass only):", prefill_s * 1000.0)
-    print("ttft_ms (incl. host argmax):", (prefill_s + argmax_prefill_s) * 1000.0)
+    print("ttft_ms (incl. GPU argmax):", (prefill_s + argmax_prefill_s) * 1000.0)
     if decode_steps > 0:
         var decode_s = Float64(t_decode_ns) / 1e9
         var argmax_decode_s = Float64(t_argmax_decode_ns) / 1e9
         print("decode_tok_s (forward-pass only):", Float64(decode_steps) / decode_s)
-        print("decode_tok_s (incl. host argmax):", Float64(decode_steps) / (decode_s + argmax_decode_s))
-        print("host_argmax_s (decode steps only):", argmax_decode_s)
-        print("host_argmax_ms_per_step:", argmax_decode_s * 1000.0 / Float64(decode_steps))
+        print("decode_tok_s (incl. GPU argmax):", Float64(decode_steps) / (decode_s + argmax_decode_s))
+        print("argmax_s (decode steps only):", argmax_decode_s)
+        print("argmax_ms_per_step:", argmax_decode_s * 1000.0 / Float64(decode_steps))
     print("total_s:", total_s)
     print("total_tokens_generated:", n_new)

@@ -23,6 +23,7 @@ from hephaestus.constants import (
     VOCAB_SIZE,
 )
 from hephaestus.forward import Activations, KVCache, forward
+from hephaestus.kernels import argmax_logits
 from hephaestus.loader import build_weights, load_arena, verify_manifest
 
 
@@ -84,6 +85,12 @@ def main() raises:
         for i in range(seq):
             h[i] = ids[i]
 
+    # GPU argmax scratch (G1a-2 follow-up: replaces a ~51.6ms/token host-side
+    # linear scan over the vocab with a ~0.35ms GPU reduction, bench/1a-ab.md
+    # Finding 2). Allocated once, reused every step.
+    var argmax_bf16 = ctx.enqueue_create_buffer[DType.bfloat16](VOCAB_SIZE)
+    var argmax_idx = ctx.enqueue_create_buffer[DType.int32](1)
+
     var f = open(out_path, "w")
     var t_decode = Int(0)
     var decode_steps = 0
@@ -109,19 +116,13 @@ def main() raises:
             t_decode += t1 - t0
             decode_steps += 1
 
-        var best = Int32(0)
-        var best_val = Float32(-3.4e38)
-        with acts.logits.map_to_host() as h:
-            var base = (n - 1) * VOCAB_SIZE
-            for i in range(VOCAB_SIZE):
-                # Greedy = argmax over the REFERENCE's logit dtype. HF's lm_head
-                # emits bf16, and torch.argmax returns the FIRST max, so ties
-                # break to the lower id. Comparing in fp32 resolves ties torch
-                # never saw and picks differently (prompt3 step7). Round first.
-                var val = h[base + i].cast[DType.bfloat16]().cast[DType.float32]()
-                if val > best_val:
-                    best_val = val
-                    best = Int32(i)
+        # Greedy = argmax over the REFERENCE's logit dtype. HF's lm_head emits
+        # bf16, and torch.argmax returns the FIRST max, so ties break to the
+        # lower id -- exactly what argmax_logits computes on-device.
+        var logits_base = acts.logits.unsafe_ptr() + (n - 1) * VOCAB_SIZE
+        var best = argmax_logits(
+            logits_base, argmax_bf16, argmax_idx, VOCAB_SIZE, ctx
+        )
         f.write(String(best) + "\n")
         with dev_ids.map_to_host() as h:
             h[0] = best

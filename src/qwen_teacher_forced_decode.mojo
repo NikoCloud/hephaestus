@@ -26,6 +26,7 @@ from hephaestus.constants import (
     VOCAB_SIZE,
 )
 from hephaestus.forward import Activations, KVCache, forward
+from hephaestus.kernels import argmax_logits
 from hephaestus.loader import build_weights, load_arena, verify_manifest
 
 comptime N_STEPS = 256
@@ -75,6 +76,9 @@ def main() raises:
         for i in range(seq0):
             h[i] = prompt[i]
 
+    var argmax_bf16 = ctx.enqueue_create_buffer[DType.bfloat16](VOCAB_SIZE)
+    var argmax_idx = ctx.enqueue_create_buffer[DType.int32](1)
+
     var fa = open(prefix + "_argmax.txt", "w")
     var mismatches = 0
 
@@ -88,18 +92,12 @@ def main() raises:
         ](weights, acts, cache, dev_ids, n, ctx)
         ctx.synchronize()
 
-        var best = 0
-        var best_val = Float32(-3.4e38)
-        with acts.logits.map_to_host() as h:
-            var base = (n - 1) * VOCAB_SIZE
-            for i in range(VOCAB_SIZE):
-                var val = h[base + i]
-                var rounded = val.cast[DType.bfloat16]().cast[DType.float32]()
-                if rounded > best_val:
-                    best_val = rounded
-                    best = i
+        var logits_base = acts.logits.unsafe_ptr() + (n - 1) * VOCAB_SIZE
+        var best = argmax_logits(
+            logits_base, argmax_bf16, argmax_idx, VOCAB_SIZE, ctx
+        )
         fa.write(String(best) + "\n")
-        if best != Int(oracle[step]):
+        if Int(best) != Int(oracle[step]):
             mismatches += 1
 
         # Teacher forcing: feed the ORACLE's token, not our own argmax.

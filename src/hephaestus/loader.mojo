@@ -139,8 +139,23 @@ def verify_manifest[
         _check_2d(entries, index, p + "mlp.down_proj.weight", hidden, inter)
 
 
+comptime LOAD_CHUNK_ELEMS = 64 * 1024 * 1024  # 128MB (BF16) per chunk
+
+
 def load_arena(ctx: DeviceContext, prefix: String) raises -> WeightArena:
-    """Reads the staged blob into a HostBuffer, copies to one DeviceBuffer."""
+    """Streams the staged blob to the device arena in fixed-size chunks.
+
+    Previously: one ~8GB HostBuffer staged the whole file, one ~8GB
+    DeviceBuffer was the arena, and a SECOND ~8GB HostBuffer held a full
+    round-trip copy-back for verification -- three ~8GB buffers alive at
+    once, measured peak VRAM ~29.6GB for the 4B model (bench/1a-ab.md
+    Finding 3). Chunking means only one small (128MB) host stage buffer and
+    one small (128MB) host verify buffer are ever alive, reused across
+    chunks -- peak VRAM is now the arena itself plus a few hundred MB, not
+    the arena times three. This also makes the verification STRICTLY
+    stronger: every chunk is checked byte-for-byte (the old large-model path
+    only sampled 4096 strided bytes + the first/last 64), not weaker.
+    """
     var entries = parse_offsets(prefix + ".offsets")
     var index = Dict[String, Int]()
     var total_bytes = 0
@@ -151,57 +166,63 @@ def load_arena(ctx: DeviceContext, prefix: String) raises -> WeightArena:
         raise Error("total byte size not BF16-aligned")
     var total_elems = total_bytes // 2
 
-    var host = ctx.enqueue_create_host_buffer[DType.bfloat16](total_elems)
-    ctx.synchronize()
-
-    # Bulk read. POSIX read caps at ~2GB per call, so loop.
-    var f = open(prefix + ".weights", "r")
-    var byte_ptr = host.unsafe_ptr().bitcast[Scalar[DType.uint8]]()
-    var done = 0
-    while done < total_bytes:
-        var n = f.read(
-            Span[Scalar[DType.uint8]](
-                ptr=byte_ptr + done, length=total_bytes - done
-            )
-        )
-        if n <= 0:
-            raise Error(
-                ".weights truncated: expected "
-                + String(total_bytes)
-                + " bytes, got "
-                + String(done)
-            )
-        done += n
-    f.close()
-
     var dev = ctx.enqueue_create_buffer[DType.bfloat16](total_elems)
-    dev.enqueue_copy_from(host)
+    var chunk_elems = min(LOAD_CHUNK_ELEMS, total_elems)
+    if chunk_elems == 0:
+        chunk_elems = 1
+    var host_chunk = ctx.enqueue_create_host_buffer[DType.bfloat16](chunk_elems)
+    var back_chunk = ctx.enqueue_create_host_buffer[DType.bfloat16](chunk_elems)
     ctx.synchronize()
 
-    # Round-trip check: copy device memory back and compare against the host
-    # buffer we filled from disk. Full compare for small models, sampled
-    # (first/last 64B + 4096 strided bytes) for large ones. GPU copies fail
-    # silently; this is the only proof the weights actually landed.
-    var back = ctx.enqueue_create_host_buffer[DType.bfloat16](total_elems)
-    dev.enqueue_copy_to(back)
-    ctx.synchronize()
-    var back_ptr = back.unsafe_ptr().bitcast[Scalar[DType.uint8]]()
-    if total_bytes <= 16 * 1024 * 1024:
-        for i in range(total_bytes):
-            if byte_ptr[i] != back_ptr[i]:
-                raise Error("round-trip mismatch at byte " + String(i))
-    else:
-        for i in range(64):
-            if byte_ptr[i] != back_ptr[i]:
-                raise Error("round-trip mismatch at byte " + String(i))
-        for i in range(total_bytes - 64, total_bytes):
-            if byte_ptr[i] != back_ptr[i]:
-                raise Error("round-trip mismatch at byte " + String(i))
-        var stride = total_bytes // 4096
-        for k in range(4096):
-            var i = k * stride
-            if byte_ptr[i] != back_ptr[i]:
-                raise Error("round-trip mismatch at byte " + String(i))
+    var f = open(prefix + ".weights", "r")
+    var dev_ptr = dev.unsafe_ptr()
+    var elems_done = 0
+    while elems_done < total_elems:
+        var this_chunk_elems = min(chunk_elems, total_elems - elems_done)
+        var chunk_bytes = this_chunk_elems * 2
+
+        # Bulk read this chunk. POSIX read caps at ~2GB per call, well above
+        # any chunk size used here, so one read suffices per chunk -- but
+        # loop defensively in case the OS returns a short read.
+        var byte_ptr = host_chunk.unsafe_ptr().bitcast[Scalar[DType.uint8]]()
+        var chunk_read = 0
+        while chunk_read < chunk_bytes:
+            var n = f.read(
+                Span[Scalar[DType.uint8]](
+                    ptr=byte_ptr + chunk_read, length=chunk_bytes - chunk_read
+                )
+            )
+            if n <= 0:
+                raise Error(
+                    ".weights truncated: expected "
+                    + String(total_bytes)
+                    + " bytes, got "
+                    + String(elems_done * 2 + chunk_read)
+                )
+            chunk_read += n
+
+        ctx.enqueue_copy(
+            dev_ptr + elems_done, host_chunk.unsafe_ptr(), this_chunk_elems
+        )
+        ctx.synchronize()
+
+        # Round-trip check: copy this chunk straight back and compare every
+        # byte against what was just staged. GPU copies fail silently; this
+        # is the only proof each chunk actually landed.
+        ctx.enqueue_copy(
+            back_chunk.unsafe_ptr(), dev_ptr + elems_done, this_chunk_elems
+        )
+        ctx.synchronize()
+        var back_byte_ptr = back_chunk.unsafe_ptr().bitcast[Scalar[DType.uint8]]()
+        for i in range(chunk_bytes):
+            if byte_ptr[i] != back_byte_ptr[i]:
+                raise Error(
+                    "round-trip mismatch at byte "
+                    + String(elems_done * 2 + i)
+                )
+
+        elems_done += this_chunk_elems
+    f.close()
 
     return WeightArena(
         buf=dev^, entries=entries^, index=index^, total_bytes=total_bytes

@@ -17,8 +17,8 @@ from std.gpu.primitives.warp import shuffle_down
 from std.math import ceildiv, cos, exp, sin, sqrt
 from std.memory import stack_allocation
 
-from std.gpu.host import DeviceContext
-from std.utils.index import IndexList
+from std.gpu.host import DeviceBuffer, DeviceContext
+from std.utils.index import Index, IndexList
 from layout import Coord, TileTensor
 from layout.tile_layout import row_major
 from linalg.gemv import gemv_gpu
@@ -588,3 +588,119 @@ def cache_write(
         grid_dim=(ceildiv(n, TPB),),
         block_dim=(TPB,),
     )
+
+
+# ===----------------------------------------------------------------------=== #
+# GPU argmax sampling: replaces a host-side per-token linear scan over the
+# full 151,936-entry vocab (measured at ~51.6ms/token -- more than the whole
+# forward pass it follows, ~800x the equivalent llama.cpp cost, bench/1a-ab.md
+# Finding 2).
+#
+# NOT vendored, despite one existing: nn.argmaxmin_gpu.argmax_gpu (wrapping
+# topk_gpu, K=1) was tried first. Its own source comments (nn/topk.mojo:736,
+# 2168-2170) claim ties resolve to the lowest index -- but that guarantee is
+# documented for TopK_2.best() (a single local heap) and for the SEPARATE
+# _gumbel_argmax_fused_kernel path, not necessarily for the multi-stage
+# reduction plain topk_gpu(sampling=False) actually runs for a
+# 151936-element single row. Measured directly (experiments/argmax_gpu_probe.mojo):
+# a hand-built exact tie between index 1632 and 11245 returned 11245 (the
+# WRONG, higher index) -- oracle over vibes; the comment did not match the
+# measured behavior for this call path, so it is not used. Written instead,
+# with the identical warp+shared-mem reduction pattern already proven
+# throughout this session (attention, QK-norm): one block, strided per-thread
+# local reduction with an explicit "value > best OR (value == best AND
+# idx < best_idx)" combine rule, then a block-wide tree reduction applying
+# the SAME rule. Cast logits F32 -> BF16 first (matching HF's bf16 lm_head,
+# the exact rounding already used by the host path this replaces). Only the
+# single winning index round-trips to host; no full-vocab host transfer.
+# ===----------------------------------------------------------------------=== #
+
+
+def cast_f32_to_bf16_kernel(
+    out_ptr: UnsafePointer[Scalar[BF16], MutAnyOrigin],
+    in_ptr: UnsafePointer[Scalar[F32], ImmutAnyOrigin],
+    n: Int,
+):
+    var i = Int(block_idx.x * block_dim.x + thread_idx.x)
+    if i >= n:
+        return
+    out_ptr[i] = in_ptr[i].cast[BF16]()
+
+
+comptime ARGMAX_TPB = 256
+
+
+def argmax_kernel(
+    out_idx_ptr: UnsafePointer[Int32, MutAnyOrigin],
+    bf16_ptr: UnsafePointer[Scalar[BF16], ImmutAnyOrigin],
+    n: Int,
+):
+    var tid = Int(thread_idx.x)
+
+    var best_val = stack_allocation[
+        ARGMAX_TPB, F32, address_space = AddressSpace.SHARED
+    ]()
+    var best_idx = stack_allocation[
+        ARGMAX_TPB, Int32, address_space = AddressSpace.SHARED
+    ]()
+
+    var local_val = Float32(-3.4e38)
+    var local_idx = Int32(-1)
+    var i = tid
+    while i < n:
+        var v = bf16_ptr[i].cast[F32]()
+        if v > local_val:
+            local_val = v
+            local_idx = Int32(i)
+        i += ARGMAX_TPB
+    best_val[tid] = local_val
+    best_idx[tid] = local_idx
+    barrier()
+
+    var stride = ARGMAX_TPB // 2
+    while stride > 0:
+        if tid < stride:
+            var other_val = best_val[tid + stride]
+            var other_idx = best_idx[tid + stride]
+            # Lowest index wins on an exact tie (matches torch.argmax /
+            # the HF-bf16-then-argmax semantics established this session).
+            if other_val > best_val[tid] or (
+                other_val == best_val[tid] and other_idx < best_idx[tid]
+            ):
+                best_val[tid] = other_val
+                best_idx[tid] = other_idx
+        barrier()
+        stride //= 2
+
+    if tid == 0:
+        out_idx_ptr[0] = best_idx[0]
+
+
+def argmax_logits(
+    logits_ptr: UnsafePointer[Scalar[F32], MutAnyOrigin],
+    mut bf16_scratch: DeviceBuffer[BF16],
+    mut idx_scratch: DeviceBuffer[DType.int32],
+    vocab: Int,
+    ctx: DeviceContext,
+) raises -> Int32:
+    comptime TPB = 256
+    ctx.enqueue_function[cast_f32_to_bf16_kernel](
+        bf16_scratch.unsafe_ptr(),
+        logits_ptr,
+        vocab,
+        grid_dim=(ceildiv(vocab, TPB),),
+        block_dim=(TPB,),
+    )
+
+    ctx.enqueue_function[argmax_kernel](
+        idx_scratch.unsafe_ptr(),
+        bf16_scratch.unsafe_ptr(),
+        vocab,
+        grid_dim=(1,),
+        block_dim=(ARGMAX_TPB,),
+    )
+
+    var best = Int32(0)
+    with idx_scratch.map_to_host() as h:
+        best = h[0]
+    return best
