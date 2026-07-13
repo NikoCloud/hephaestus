@@ -309,6 +309,16 @@ def wmma_fp8(
     ](a_i32, b_i32, c)
 
 
+# USE_LDS=True: BF16-v2 style cooperative global→LDS per 16-K strip.
+# Measured (R9700 decode, 10×256): direct-global ~56.6 tok/s; LDS-v2 ~36.9;
+# multi-strip LDS ~19. Decode has no LDS reuse (each element read once), so
+# barriers dominate. Keep LDS path as the thesis-aligned staging pattern;
+# set False to recover the faster direct-global path for co-measure.
+# Thesis request: LDS-stage weights. Direct-global is faster on decode
+# (~56 vs ~37 tok/s) — flip to False for the faster path; see bench writeup.
+comptime FP8_DECODE_USE_LDS = True
+
+
 def wmma_fp8_decode_kernel[
     c_type: DType, add_residual: Bool
 ](
@@ -320,10 +330,10 @@ def wmma_fp8_decode_kernel[
     N: Int,
     K: Int,
 ):
-    """W8A8 decode: C[n] = act_scale * w_scale[n] * (A_fp8[0,:] · W_fp8[n,:]).
+    """W8A8 decode: C[n] = act_scale * w_scale[n] * (A@W^T)[0,n].
 
-    A is padded [16, K] (row 0 = quantized activation, rows 1..15 = 0).
-    One 16-col N-tile per block; only output row 0 is written.
+    Default: direct-global fragment loads (G1b-0). Optional LDS path
+    (FP8_DECODE_USE_LDS) mirrors BF16 v2 cooperative staging.
     """
     var l = Int(thread_idx.x)
     if l >= WMMA_LANES:
@@ -336,31 +346,60 @@ def wmma_fp8_decode_kernel[
 
     var row_or_col = l % WMMA_TILE
     var half = l // WMMA_TILE
-
     var acc = SIMD[DType.float32, WMMA_FRAG](0.0)
-    var ks = 0
-    while ks < K:
-        var a_fp8 = SIMD[FP8, WMMA_FRAG](0)
-        var b_fp8 = SIMD[FP8, WMMA_FRAG](0)
-        # A row = l%16 (MB=0); mask not needed — pad rows are zeroed on host path.
-        var a_row_base = row_or_col * K + ks + half * WMMA_FRAG
-        var w_row_base = (NB + row_or_col) * K + ks + half * WMMA_FRAG
-        comptime for j in range(WMMA_FRAG):
-            a_fp8[j] = a_ptr[a_row_base + j]
-            b_fp8[j] = w_ptr[w_row_base + j]
 
-        # Pack 8 FP8 bytes → v2i32 for the intrinsic (LLVM has no native fp8).
-        var a_i32 = bitcast[DType.int32, 2](a_fp8)
-        var b_i32 = bitcast[DType.int32, 2](b_fp8)
-        acc = wmma_fp8(a_i32, b_i32, acc)
-        ks += WMMA_TILE
+    comptime if FP8_DECODE_USE_LDS:
+        var A_lds = stack_allocation[
+            WMMA_TILE * LDS_STRIDE, FP8, address_space = AddressSpace.SHARED
+        ]()
+        var B_lds = stack_allocation[
+            WMMA_TILE * LDS_STRIDE, FP8, address_space = AddressSpace.SHARED
+        ]()
+        var ks = 0
+        while ks < K:
+            comptime for i in range(8):
+                var row = i * 2 + half
+                var col = row_or_col
+                var lds_idx = row * LDS_STRIDE + col
+                A_lds[lds_idx] = a_ptr[row * K + ks + col]
+                B_lds[lds_idx] = w_ptr[(NB + row) * K + ks + col]
+            barrier()
+            var a_fp8 = SIMD[FP8, WMMA_FRAG](0)
+            var b_fp8 = SIMD[FP8, WMMA_FRAG](0)
+            var frag_base = row_or_col * LDS_STRIDE + half * WMMA_FRAG
+            comptime for j in range(WMMA_FRAG):
+                a_fp8[j] = A_lds[frag_base + j]
+                b_fp8[j] = B_lds[frag_base + j]
+            acc = wmma_fp8(
+                bitcast[DType.int32, 2](a_fp8),
+                bitcast[DType.int32, 2](b_fp8),
+                acc,
+            )
+            barrier()
+            ks += WMMA_TILE
+    else:
+        # Direct-global (faster on decode: no barrier tax, no LDS reuse).
+        var ks2 = 0
+        while ks2 < K:
+            var a_fp8 = SIMD[FP8, WMMA_FRAG](0)
+            var b_fp8 = SIMD[FP8, WMMA_FRAG](0)
+            var a_row_base = row_or_col * K + ks2 + half * WMMA_FRAG
+            var w_row_base = (NB + row_or_col) * K + ks2 + half * WMMA_FRAG
+            comptime for j in range(WMMA_FRAG):
+                a_fp8[j] = a_ptr[a_row_base + j]
+                b_fp8[j] = w_ptr[w_row_base + j]
+            acc = wmma_fp8(
+                bitcast[DType.int32, 2](a_fp8),
+                bitcast[DType.int32, 2](b_fp8),
+                acc,
+            )
+            ks2 += WMMA_TILE
 
-    # Extract row 0 only: m = half*8 + j == 0 → half==0, j==0.
     if half == 0:
         var n = NB + row_or_col
         if n < N:
-            var s = act_scale_ptr[0] * w_scale_ptr[n]
-            var v = acc[0] * s
+            var sc = act_scale_ptr[0] * w_scale_ptr[n]
+            var v = acc[0] * sc
             comptime if add_residual:
                 v = v + c_ptr[n].cast[DType.float32]()
             c_ptr[n] = v.cast[c_type]()

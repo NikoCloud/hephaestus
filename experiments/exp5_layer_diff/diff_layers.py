@@ -148,7 +148,10 @@ def load_npy(path: Path) -> np.ndarray:
 
 
 def tensor_stats(
-    got: np.ndarray, ref: np.ndarray
+    got: np.ndarray,
+    ref: np.ndarray,
+    atol: float = ATOL,
+    rtol: float = RTOL,
 ) -> tuple[float, float, int, int, bool]:
     """max_abs, max_rel, n_exceed, n_elems, bitexact."""
     if got.shape != ref.shape:
@@ -162,7 +165,7 @@ def tensor_stats(
     r = ref.astype(np.float64)
     ae = np.abs(g - r)
     re = ae / np.maximum(np.abs(r), 1e-30)
-    tol = ATOL + RTOL * np.abs(r)
+    tol = atol + rtol * np.abs(r)
     n_exceed = int(np.sum(ae > tol))
     return float(ae.max()), float(re.max()), n_exceed, int(got.size), bitexact
 
@@ -175,7 +178,13 @@ def list_stems(npy_dir: Path) -> list[str]:
     return stems
 
 
-def diff_dirs(dir_a: Path, dir_b: Path, exact: bool) -> int:
+def diff_dirs(
+    dir_a: Path,
+    dir_b: Path,
+    exact: bool,
+    atol: float = ATOL,
+    rtol: float = RTOL,
+) -> int:
     """Compare dir_a (reference) vs dir_b (candidate)."""
     stems_a = set(list_stems(dir_a))
     stems_b = set(list_stems(dir_b))
@@ -192,7 +201,10 @@ def diff_dirs(dir_a: Path, dir_b: Path, exact: bool) -> int:
         return 2
 
     print(f"comparing {len(common)} tensors  ref={dir_a}  got={dir_b}")
-    print(f"tolerance: {ATOL} + {RTOL}*|ref|" + ("  mode=EXACT" if exact else ""))
+    print(
+        f"tolerance: {atol} + {rtol}*|ref|"
+        + ("  mode=EXACT" if exact else "")
+    )
 
     first_div: str | None = None
     first_div_layer: int | None = None
@@ -204,7 +216,9 @@ def diff_dirs(dir_a: Path, dir_b: Path, exact: bool) -> int:
     for stem in common:
         ref = load_npy(dir_a / f"{stem}.npy")
         got = load_npy(dir_b / f"{stem}.npy")
-        max_abs, max_rel, n_ex, n_el, bitexact = tensor_stats(got, ref)
+        max_abs, max_rel, n_ex, n_el, bitexact = tensor_stats(
+            got, ref, atol=atol, rtol=rtol
+        )
         rows.append((stem, max_abs, max_rel, n_ex, n_el, bitexact))
         if bitexact:
             n_bitexact += 1
@@ -297,12 +311,28 @@ def main() -> int:
         action="store_true",
         help="require bitwise identity (determinism self-test)",
     )
+    d.add_argument(
+        "--atol",
+        type=float,
+        default=None,
+        help="absolute tolerance (default 1e-5; use 1e-3 for W8A8)",
+    )
+    d.add_argument(
+        "--rtol",
+        type=float,
+        default=None,
+        help="relative tolerance (default 1.6e-2; use 5e-2 for W8A8)",
+    )
 
     args = ap.parse_args()
     if args.cmd == "pack":
         return pack_dir(args.raw_dir, args.npy_dir)
     if args.cmd == "diff":
-        return diff_dirs(args.dir_a, args.dir_b, args.exact)
+        atol = ATOL if args.atol is None else args.atol
+        rtol = RTOL if args.rtol is None else args.rtol
+        return diff_dirs(
+            args.dir_a, args.dir_b, args.exact, atol=atol, rtol=rtol
+        )
     return 2
 
 
