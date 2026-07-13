@@ -59,16 +59,55 @@ Equal-precision grade: at BF16/F16, we are **~6× behind** Vulkan llama.cpp F16 
 
 ---
 
-## Implications for FP8 / remaining roadmap
+## Implications for FP8 / remaining roadmap (prefill)
 
 | Target | tok/s | vs Hephaestus 1398 |
 |--------|------:|-------------------:|
 | Match F16 llama.cpp | ~8134 | **5.8×** |
 | Clear G1b-3 (1.5× Q8) | **~11532** | **8.2×** |
 
-- **Gate is far above** where stopgap + v3a landed (~1400).
-- **FP8 alone** (bandwidth/compute win on GEMM) cannot close an 8× e2e gap when attention was already ~65% before the stopgap and QK still dominates remaining attention (~58% of attention time). Plausible FP8 GEMM lift (e.g. 1.5–2× on the GEMM slice only) is **not enough** without a flash/WMMA-class attention path matching llama.cpp’s Vulkan coopmat attention.
-- **Honest read:** G1b-3 as *measured* is a **multi-kernel** target (attention + GEMM), not “FP8 the matmuls and we’re done.” The gate number is real; the path still requires competitive attention (and then FP8).
+- **G1b-3 prefill gate is being retired as primary** — unreachable without llama.cpp-class attention + more.
+- Prefill still matters for product quality, but **decode (G1b-2) is the primary speed gate** going forward.
+
+---
+
+## Decode results (tg128, tok/s) — G1b-2 baseline
+
+Measured 2026-07-13, same machine/backend/device as prefill (`-p 0 -n 128 -r 5 -ngl 99 -dev Vulkan0`).
+
+| quant | size | tg128 (5 reps) |
+|-------|------|----------------|
+| **F16** | 7.49 GiB | **75.17 ± 0.10** |
+| **Q8_0** | 3.98 GiB | **127.25 ± 0.21** |
+
+Raw:
+
+```
+| qwen3 4B F16  | 7.49 GiB | 4.02 B | Vulkan | 99 | Vulkan0 | tg128 |  75.17 ± 0.10 |
+| qwen3 4B Q8_0 | 3.98 GiB | 4.02 B | Vulkan | 99 | Vulkan0 | tg128 | 127.25 ± 0.21 |
+```
+
+**G1b-2 gate (match or beat Q8_0 decode):** **≈ 127.3 tok/s**
+
+Unlike prefill, Q8_0 **beats** F16 on decode here (~1.7×) — memory-bound decode benefits from the smaller weight footprint.
+
+---
+
+## Where Hephaestus BF16 decode (~54 tok/s) sits
+
+Phase 1a / G1a-2 Hephaestus decode (forward-only, ~**54 tok/s** from prior benches — e.g. `bench/1a-ab.md` ~52.8–54.4):
+
+| Comparison | Ratio | Comment |
+|------------|------:|---------|
+| vs llama.cpp **F16** (matched precision) | **0.72×** (72%) | Within striking distance at 16-bit |
+| vs llama.cpp **Q8_0** (**G1b-2 gate**) | **0.42×** (42%) | Need **~2.4×** for gate |
+
+| Target | tok/s | vs Hephaestus ~54 |
+|--------|------:|------------------:|
+| Match F16 decode | ~75 | **1.4×** |
+| **G1b-2 = match Q8_0 decode** | **~127** | **~2.4×** |
+
+**Read for FP8 on decode:** closing **~2.4×** to Q8_0 is a plausible GEMV/weight-bandwidth win if FP8 decode path is solid; matching F16 (~1.4×) is an intermediate equal-precision bar. Unlike the retired prefill 8× cliff, **decode is a realistic primary gate**.
 
 ---
 
@@ -87,7 +126,7 @@ rocm-smi --showpids
   /mnt/models/models/qwen3-4b-instruct-2507-f16.gguf \
   /mnt/models/models/qwen3-4b-instruct-2507-q8_0.gguf Q8_0
 
-# Bench (prefill only)
+# Prefill
 HIP_VISIBLE_DEVICES=0 ~/projects/llama.cpp/build-vulkan/bin/llama-bench \
   -m /mnt/models/models/qwen3-4b-instruct-2507-f16.gguf \
   -p 512 -n 0 -r 5 -ngl 99 -dev Vulkan0
@@ -95,4 +134,13 @@ HIP_VISIBLE_DEVICES=0 ~/projects/llama.cpp/build-vulkan/bin/llama-bench \
 HIP_VISIBLE_DEVICES=0 ~/projects/llama.cpp/build-vulkan/bin/llama-bench \
   -m /mnt/models/models/qwen3-4b-instruct-2507-q8_0.gguf \
   -p 512 -n 0 -r 5 -ngl 99 -dev Vulkan0
+
+# Decode (tg128)
+HIP_VISIBLE_DEVICES=0 ~/projects/llama.cpp/build-vulkan/bin/llama-bench \
+  -m /mnt/models/models/qwen3-4b-instruct-2507-f16.gguf \
+  -p 0 -n 128 -r 5 -ngl 99 -dev Vulkan0
+
+HIP_VISIBLE_DEVICES=0 ~/projects/llama.cpp/build-vulkan/bin/llama-bench \
+  -m /mnt/models/models/qwen3-4b-instruct-2507-q8_0.gguf \
+  -p 0 -n 128 -r 5 -ngl 99 -dev Vulkan0
 ```
