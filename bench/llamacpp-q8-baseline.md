@@ -1,11 +1,13 @@
-# llama.cpp prefill baseline — G1b-3 gate measurement (2026-07-13)
+# llama.cpp baseline — prefill (G1b-3) + decode (G1b-2) on R9700 Vulkan (2026-07-13)
 
 **Hardware:** GPU 0 = AMD Radeon AI PRO R9700 32GB (gfx1201 / RADV)  
 **Model:** Qwen3-4B-Instruct-2507  
 **Tool:** `~/projects/llama.cpp/build-vulkan/bin/llama-bench` build `33ca0dcb9 (9906)`, **Vulkan** backend  
 **Device:** `Vulkan0` = R9700 (verified via `llama-bench --list-devices`)  
-**Method:** `-p 512 -n 0 -r 5 -ngl 99 -dev Vulkan0`  
-**GPU hygiene:** KFD empty; stopped `llama-server` on Vulkan1 (9070 XT) before runs. Only monitoring (`nvtop`/`amdgpu_top`) remained.
+**Methods:**
+- Prefill: `-p 512 -n 0 -r 5 -ngl 99 -dev Vulkan0`
+- Decode: `-p 0 -n 128 -r 5 -ngl 99 -dev Vulkan0` (tg128)
+**GPU hygiene:** KFD empty; no compute on either GPU (monitors only: `nvtop`/`amdgpu_top`).
 
 GGUFs:
 - F16: `/mnt/models/models/qwen3-4b-instruct-2507-f16.gguf` (7.49 GiB, 4.02B)
