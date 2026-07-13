@@ -1,14 +1,16 @@
 # ===----------------------------------------------------------------------=== #
-# Hephaestus -- hand-written GPU kernels (Phase 1a, BF16)
+# Hephaestus -- hand-written GPU kernels (Phase 1a→1b, BF16)
 #
-# Everything here is elementwise or reduction work. NOTHING here uses WMMA:
-# no WMMA intrinsic of any dtype compiles on gfx1201 in Mojo 1.0.0b3.dev2026071006
-# (DECISIONS.md 2026-07-12), which rules out the vendored RDNA matmul and
-# attention kernels. Matmul goes through matmul_kernel_naive; attention is
-# written here.
+# Prefill matmul (m>1): gfx12 BF16 WMMA GEMM (exp4b, G1b-0 mappings) when
+# n and k are multiples of 16 (all model dims are). Decode (m=1) stays on
+# gemv_gpu — a 16×16 WMMA tile would waste 15/16 rows.
 #
-# Vendored where possible: rms_norm_gpu (normalization), gather (embedding),
-# get_safetensors_idx (RoPE index convention).
+# Elementwise / reduction kernels (RoPE, attention, silu, argmax) are unchanged.
+# Vendored where possible: rms_norm_gpu, gather, get_safetensors_idx.
+#
+# Requires Mojo nightly with llvm_intrinsic WMMA (dev2026071206+). The repo
+# default pixi pin may be older — build/run prefill-WMMA with the isolated
+# hephaestus-wmma-nightly env.
 # ===----------------------------------------------------------------------=== #
 
 from std.gpu import barrier, block_dim, block_idx, thread_idx
@@ -24,18 +26,13 @@ from layout.tile_layout import row_major
 from linalg.gemv import gemv_gpu
 from linalg.matmul.gpu import matmul_kernel_naive
 
+from hephaestus.wmma_gfx12 import WMMA_TILE, wmma_gemm_bf16
+
 comptime BF16 = DType.bfloat16
 comptime F32 = DType.float32
 
 
-# ===----------------------------------------------------------------------=== #
-# Linear projection: C[m, n] = A[m, k] @ B[n, k]^T
-# B is the weight straight from the arena in safetensors [out, in] order, so
-# transpose_b=True is the zero-copy path (DECISIONS 2026-07-11).
-# ===----------------------------------------------------------------------=== #
-
-
-def linear(
+def _linear_naive(
     c: TileTensor[mut=True, ...],
     a: TileTensor[BF16, ...],
     b: TileTensor[BF16, ...],
@@ -44,19 +41,7 @@ def linear(
     k: Int,
     ctx: DeviceContext,
 ) raises:
-    """C = A @ B^T. c may be BF16 (activations) or F32 (logits: the LM head
-    output must NOT be rounded to BF16 -- a one-ulp gap between the top two
-    tokens is decidable in fp32 and a coin-flip tie in bf16).
-
-    Decode (m=1) routes to the vendored gemv_gpu (G1a-2): the naive kernel's
-    16x16 thread block wastes 15/16 of its threads on a single-row output.
-    No WMMA involved -- gemv_gpu is one of the two paths proven to compile
-    and be correct on gfx1201 (exp3e, DECISIONS.md 2026-07-12).
-    """
-    if m == 1:
-        gemv_gpu[transpose_b=True](c, a, b, ctx)
-        return
-
+    """Fallback: vendored matmul_kernel_naive (transpose_b=True)."""
     comptime BLOCK_DIM = 16
     comptime kernel = matmul_kernel_naive[
         type_of(c).dtype,
@@ -81,6 +66,48 @@ def linear(
         grid_dim=(ceildiv(m, BLOCK_DIM), ceildiv(n, BLOCK_DIM)),
         block_dim=(BLOCK_DIM, BLOCK_DIM),
     )
+
+
+# ===----------------------------------------------------------------------=== #
+# Linear projection: C[m, n] = A[m, k] @ B[n, k]^T
+# B is the weight straight from the arena in safetensors [out, in] order, so
+# transpose_b=True is the zero-copy path (DECISIONS 2026-07-11).
+# ===----------------------------------------------------------------------=== #
+
+
+def linear(
+    c: TileTensor[mut=True, ...],
+    a: TileTensor[BF16, ...],
+    b: TileTensor[BF16, ...],
+    m: Int,
+    n: Int,
+    k: Int,
+    ctx: DeviceContext,
+    *,
+    use_wmma: Bool = True,
+) raises:
+    """C = A @ B^T. c may be BF16 (activations) or F32 (logits: the LM head
+    output must NOT be rounded to BF16 -- a one-ulp gap between the top two
+    tokens is decidable in fp32 and a coin-flip tie in bf16).
+
+    Decode (m=1) → gemv_gpu. Prefill (m>1) → gfx12 BF16 WMMA when n and k
+    are divisible by 16 (model dims always are); otherwise naive fallback.
+    Pass use_wmma=False to force the naive path (layer-diff harness).
+    """
+    if m == 1:
+        gemv_gpu[transpose_b=True](c, a, b, ctx)
+        return
+
+    # WMMA path: N and K must be tile-aligned. M is edge-masked in the kernel.
+    if (
+        use_wmma
+        and n % WMMA_TILE == 0
+        and k % WMMA_TILE == 0
+    ):
+        wmma_gemm_bf16[type_of(c).dtype](c, a, b, m, n, k, ctx)
+        return
+
+    _linear_naive(c, a, b, m, n, k, ctx)
 
 
 def linear_add_residual(
@@ -685,7 +712,7 @@ def argmax_logits(
 ) raises -> Int32:
     comptime TPB = 256
     ctx.enqueue_function[cast_f32_to_bf16_kernel](
-        bf16_scratch.unsafe_ptr(),
+        bf16_scratch.unsafe_ptr().as_unsafe_any_origin(),
         logits_ptr,
         vocab,
         grid_dim=(ceildiv(vocab, TPB),),
@@ -693,8 +720,8 @@ def argmax_logits(
     )
 
     ctx.enqueue_function[argmax_kernel](
-        idx_scratch.unsafe_ptr(),
-        bf16_scratch.unsafe_ptr(),
+        idx_scratch.unsafe_ptr().as_unsafe_any_origin(),
+        bf16_scratch.unsafe_ptr().as_unsafe_any_origin(),
         vocab,
         grid_dim=(1,),
         block_dim=(ARGMAX_TPB,),

@@ -234,6 +234,7 @@ def forward_dump[
     dump_dir: String,
     dump_all_layers: Bool,
     step: Int,
+    use_wmma: Bool,
 ) raises:
     comptime group = n_heads // n_kv_heads
     var past = cache.length
@@ -296,7 +297,7 @@ def forward_dump[
         # Host-side offset of the new K/V slice inside the full cache buffer.
         var k_host_off = layer_off + past * kv_out
 
-        linear(q, xn, layer.q_proj, seq, q_out, hidden, ctx)
+        linear(q, xn, layer.q_proj, seq, q_out, hidden, ctx, use_wmma=use_wmma)
         if do_dump:
             dump_bf16_device(
                 dump_dir,
@@ -309,7 +310,9 @@ def forward_dump[
                 catalog,
             )
 
-        linear(k_dst, xn, layer.k_proj, seq, kv_out, hidden, ctx)
+        linear(
+            k_dst, xn, layer.k_proj, seq, kv_out, hidden, ctx, use_wmma=use_wmma
+        )
         if do_dump:
             dump_bf16_device(
                 dump_dir,
@@ -322,7 +325,9 @@ def forward_dump[
                 catalog,
             )
 
-        linear(v_dst, xn, layer.v_proj, seq, kv_out, hidden, ctx)
+        linear(
+            v_dst, xn, layer.v_proj, seq, kv_out, hidden, ctx, use_wmma=use_wmma
+        )
         if do_dump:
             dump_bf16_device(
                 dump_dir,
@@ -464,7 +469,9 @@ def forward_dump[
                 catalog,
             )
 
-        linear(gate, xn, layer.gate_proj, seq, inter, hidden, ctx)
+        linear(
+            gate, xn, layer.gate_proj, seq, inter, hidden, ctx, use_wmma=use_wmma
+        )
         if do_dump:
             dump_bf16_device(
                 dump_dir,
@@ -477,7 +484,9 @@ def forward_dump[
                 catalog,
             )
 
-        linear(up, xn, layer.up_proj, seq, inter, hidden, ctx)
+        linear(
+            up, xn, layer.up_proj, seq, inter, hidden, ctx, use_wmma=use_wmma
+        )
         if do_dump:
             dump_bf16_device(
                 dump_dir,
@@ -544,7 +553,16 @@ def forward_dump[
     )
 
     var logits = TileTensor(acts.logits, row_major(Coord(Index(seq, vocab))))
-    linear(logits, xn, weights.embed_tokens, seq, vocab, hidden, ctx)
+    linear(
+        logits,
+        xn,
+        weights.embed_tokens,
+        seq,
+        vocab,
+        hidden,
+        ctx,
+        use_wmma=use_wmma,
+    )
     dump_f32_device(
         dump_dir,
         fprefix + "lm_head",
@@ -597,14 +615,17 @@ def read_ids(path: String) raises -> List[Int32]:
     return ids^
 
 
-def run_tiny(dump_dir: String, prompt_idx: Int) raises:
+def run_tiny(dump_dir: String, prompt_idx: Int, use_wmma: Bool) raises:
     var ids = prompt_ids_tiny(prompt_idx)
     var seq = len(ids)
+    var path_name = String("wmma") if use_wmma else String("naive")
     print(
         "dump tiny prompt",
         prompt_idx,
         "seq",
         seq,
+        "path",
+        path_name,
         "->",
         dump_dir,
         "(all layers)",
@@ -655,17 +676,20 @@ def run_tiny(dump_dir: String, prompt_idx: Int) raises:
         n_heads=TINY_N_HEADS,
         n_kv_heads=TINY_N_KV,
         theta=TINY_THETA,
-    ](weights, acts, cache, dev_ids, seq, ctx, dump_dir, True, 0)
+    ](weights, acts, cache, dev_ids, seq, ctx, dump_dir, True, 0, use_wmma)
     ctx.synchronize()
     print("tiny dump complete")
 
 
-def run_4b(dump_dir: String, ids_path: String) raises:
+def run_4b(dump_dir: String, ids_path: String, use_wmma: Bool) raises:
     var ids = read_ids(ids_path)
     var seq = len(ids)
+    var path_name = String("wmma") if use_wmma else String("naive")
     print(
         "dump 4b seq",
         seq,
+        "path",
+        path_name,
         "->",
         dump_dir,
         "(selective layers 0,1,mid,end)",
@@ -716,30 +740,38 @@ def run_4b(dump_dir: String, ids_path: String) raises:
         n_heads=NUM_HEADS,
         n_kv_heads=NUM_KV_HEADS,
         theta=ROPE_THETA,
-    ](weights, acts, cache, dev_ids, seq, ctx, dump_dir, False, 0)
+    ](weights, acts, cache, dev_ids, seq, ctx, dump_dir, False, 0, use_wmma)
     ctx.synchronize()
     print("4b dump complete")
 
 
 def main() raises:
-    if len(argv()) < 3:
+    if len(argv()) < 4:
         print(
-            "usage: dump_activations tiny <dump_dir> [prompt_idx]"
-            " | 4b <dump_dir> <ids.txt>"
+            "usage: dump_activations tiny|4b <naive|wmma> <dump_dir>"
+            " [prompt_idx|ids.txt]"
         )
         raise Error("bad args")
 
     var mode = String(argv()[1])
-    var dump_dir = String(argv()[2])
+    var path = String(argv()[2])
+    var dump_dir = String(argv()[3])
+    var use_wmma: Bool
+    if path == "wmma":
+        use_wmma = True
+    elif path == "naive":
+        use_wmma = False
+    else:
+        raise Error("path must be naive or wmma")
 
     if mode == "tiny":
         var prompt_idx = 1
-        if len(argv()) > 3:
-            prompt_idx = Int(String(argv()[3]))
-        run_tiny(dump_dir, prompt_idx)
+        if len(argv()) > 4:
+            prompt_idx = Int(String(argv()[4]))
+        run_tiny(dump_dir, prompt_idx, use_wmma)
     elif mode == "4b":
-        if len(argv()) < 4:
+        if len(argv()) < 5:
             raise Error("4b mode needs <ids.txt>")
-        run_4b(dump_dir, String(argv()[3]))
+        run_4b(dump_dir, String(argv()[4]), use_wmma)
     else:
         raise Error("mode must be tiny or 4b")

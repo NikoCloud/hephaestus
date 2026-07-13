@@ -45,20 +45,22 @@ pixi run python -c "from ml_dtypes import bfloat16; import numpy; print('python 
 DUMP_SRC="$REPO/experiments/exp5_layer_diff/dump_activations.mojo"
 DIFF_PY="$REPO/experiments/exp5_layer_diff/diff_layers.py"
 
-echo "=== dump A (tiny prompt $PROMPT) ==="
+# Determinism self-test uses the naive path (no WMMA needed; works on
+# repo-default Mojo). For naive-vs-WMMA comparison see run_naive_vs_wmma.sh.
+echo "=== dump A (tiny prompt $PROMPT, naive) ==="
 wait_gpu
 rm -rf "$RAW_A"/* "$NPY_A"/*
 pixi run mojo run -I "$KERNELS" -I src \
-    "$DUMP_SRC" tiny "$RAW_A" "$PROMPT"
+    "$DUMP_SRC" tiny naive "$RAW_A" "$PROMPT"
 
 echo "=== pack A ==="
 pixi run python "$DIFF_PY" pack "$RAW_A" "$NPY_A"
 
-echo "=== dump B (tiny prompt $PROMPT, second run) ==="
+echo "=== dump B (tiny prompt $PROMPT, naive, second run) ==="
 wait_gpu
 rm -rf "$RAW_B"/* "$NPY_B"/*
 pixi run mojo run -I "$KERNELS" -I src \
-    "$DUMP_SRC" tiny "$RAW_B" "$PROMPT"
+    "$DUMP_SRC" tiny naive "$RAW_B" "$PROMPT"
 
 echo "=== pack B ==="
 pixi run python "$DIFF_PY" pack "$RAW_B" "$NPY_B"

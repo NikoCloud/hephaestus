@@ -101,7 +101,9 @@ def main() raises:
             decode_steps += 1
 
         var t_am0 = perf_counter_ns()
-        var logits_base = acts.logits.unsafe_ptr() + (n - 1) * VOCAB_SIZE
+        var logits_base = (
+            acts.logits.unsafe_ptr() + (n - 1) * VOCAB_SIZE
+        ).as_unsafe_any_origin()
         var best = argmax_logits(
             logits_base, argmax_bf16, argmax_idx, VOCAB_SIZE, ctx
         )

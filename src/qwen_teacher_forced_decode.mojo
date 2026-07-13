@@ -92,7 +92,9 @@ def main() raises:
         ](weights, acts, cache, dev_ids, n, ctx)
         ctx.synchronize()
 
-        var logits_base = acts.logits.unsafe_ptr() + (n - 1) * VOCAB_SIZE
+        var logits_base = (
+            acts.logits.unsafe_ptr() + (n - 1) * VOCAB_SIZE
+        ).as_unsafe_any_origin()
         var best = argmax_logits(
             logits_base, argmax_bf16, argmax_idx, VOCAB_SIZE, ctx
         )

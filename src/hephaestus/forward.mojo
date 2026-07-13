@@ -175,7 +175,14 @@ def forward[
         ref layer = weights.layers[i]
 
         # --- attention block ------------------------------------------------
-        _rms_norm(acts.xn.unsafe_ptr(), acts.x.unsafe_ptr(), layer.attn_norm, seq, hidden, ctx)
+        _rms_norm(
+            acts.xn.unsafe_ptr().as_unsafe_any_origin(),
+            acts.x.unsafe_ptr().as_unsafe_any_origin(),
+            layer.attn_norm,
+            seq,
+            hidden,
+            ctx,
+        )
 
         # K/V projections write DIRECTLY into this layer's cache slot (G1a-2:
         # removes the separate cache_write copy kernel -- 2 fewer launches per
@@ -200,20 +207,40 @@ def forward[
 
         # QK norm: per-head RMSNorm over head_dim. Rows = seq*heads, and the
         # kernel derives cols from gamma.dim[0] = head_dim. V is NOT normed.
-        _rms_norm(acts.q.unsafe_ptr(), acts.q.unsafe_ptr(), layer.q_norm, seq * n_heads, head_dim, ctx)
-        _rms_norm(k_new_ptr, k_new_ptr, layer.k_norm, seq * n_kv_heads, head_dim, ctx)
+        _rms_norm(
+            acts.q.unsafe_ptr().as_unsafe_any_origin(),
+            acts.q.unsafe_ptr().as_unsafe_any_origin(),
+            layer.q_norm,
+            seq * n_heads,
+            head_dim,
+            ctx,
+        )
+        _rms_norm(
+            k_new_ptr.as_unsafe_any_origin(),
+            k_new_ptr.as_unsafe_any_origin(),
+            layer.k_norm,
+            seq * n_kv_heads,
+            head_dim,
+            ctx,
+        )
 
         # RoPE after QK-norm (HF order). Split-half convention. Q and K in
         # one launch (G1a-2: one fewer kernel per layer).
         apply_rope_qk_inplace[head_dim, theta](
-            acts.q.unsafe_ptr(), k_new_ptr, n_heads, n_kv_heads, seq, past, ctx
+            acts.q.unsafe_ptr().as_unsafe_any_origin(),
+            k_new_ptr.as_unsafe_any_origin(),
+            n_heads,
+            n_kv_heads,
+            seq,
+            past,
+            ctx,
         )
 
         attention[head_dim, group](
-            acts.attn_out.unsafe_ptr(),
-            acts.q.unsafe_ptr(),
-            k_cache,
-            v_cache,
+            acts.attn_out.unsafe_ptr().as_unsafe_any_origin(),
+            acts.q.unsafe_ptr().as_unsafe_any_origin(),
+            k_cache.as_unsafe_any_origin(),
+            v_cache.as_unsafe_any_origin(),
             n_heads,
             n_kv_heads,
             seq,
@@ -224,20 +251,34 @@ def forward[
         linear_add_residual(x, attn_out, layer.o_proj, seq, hidden, q_out, ctx)
 
         # --- FFN block ------------------------------------------------------
-        _rms_norm(acts.xn.unsafe_ptr(), acts.x.unsafe_ptr(), layer.ffn_norm, seq, hidden, ctx)
+        _rms_norm(
+            acts.xn.unsafe_ptr().as_unsafe_any_origin(),
+            acts.x.unsafe_ptr().as_unsafe_any_origin(),
+            layer.ffn_norm,
+            seq,
+            hidden,
+            ctx,
+        )
         linear(gate, xn, layer.gate_proj, seq, inter, hidden, ctx)
         linear(up, xn, layer.up_proj, seq, inter, hidden, ctx)
         silu_mul(
-            acts.act.unsafe_ptr(),
-            acts.gate.unsafe_ptr(),
-            acts.up.unsafe_ptr(),
+            acts.act.unsafe_ptr().as_unsafe_any_origin(),
+            acts.gate.unsafe_ptr().as_unsafe_any_origin(),
+            acts.up.unsafe_ptr().as_unsafe_any_origin(),
             seq * inter,
             ctx,
         )
         linear_add_residual(x, act, layer.down_proj, seq, hidden, inter, ctx)
 
     # --- final norm + LM head (tied: embed_tokens IS the head) --------------
-    _rms_norm(acts.xn.unsafe_ptr(), acts.x.unsafe_ptr(), weights.output_norm, seq, hidden, ctx)
+    _rms_norm(
+        acts.xn.unsafe_ptr().as_unsafe_any_origin(),
+        acts.x.unsafe_ptr().as_unsafe_any_origin(),
+        weights.output_norm,
+        seq,
+        hidden,
+        ctx,
+    )
     var logits = TileTensor(acts.logits, row_major(Coord(Index(seq, vocab))))
     linear(logits, xn, weights.embed_tokens, seq, vocab, hidden, ctx)
 
