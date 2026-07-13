@@ -14,21 +14,25 @@
 # ===----------------------------------------------------------------------=== #
 
 from std.gpu import WARP_SIZE, barrier, block_dim, block_idx, thread_idx
-from std.gpu.host import DeviceBuffer, DeviceContext, get_gpu_target
+from std.gpu.host import DeviceBuffer, DeviceContext
 from std.gpu.memory import AddressSpace
-from std.gpu.primitives.grid_controls import PDLLevel, pdl_launch_attributes
 from std.gpu.primitives.warp import shuffle_down
-from std.math import align_up, ceildiv, cos, exp, sin, sqrt
+from std.math import ceildiv, cos, exp, sin, sqrt
 from std.memory import stack_allocation
-from std.sys import simd_width_of
 from std.utils.index import Index, IndexList
 
 from layout import Coord, TileTensor
 from layout.tile_layout import row_major
-from linalg.gemv import gemv_gpu, gemv_kernel_vector
+from linalg.gemv import gemv_gpu
 from linalg.matmul.gpu import matmul_kernel_naive
 
-from hephaestus.wmma_gfx12 import WMMA_TILE, wmma_gemm_bf16
+from hephaestus.wmma_gfx12 import (
+    FP8,
+    FP8_E4M3_MAX,
+    WMMA_TILE,
+    wmma_gemm_bf16,
+    wmma_gemm_fp8_decode,
+)
 
 comptime BF16 = DType.bfloat16
 comptime F32 = DType.float32
@@ -113,14 +117,93 @@ def linear(
 
 
 # ===----------------------------------------------------------------------=== #
-# FP8 E4M3 GEMV (decode M=1): y[n] = scale[n] * sum_k fp8(W[n,k]) * bf16(x[k])
-# Weights stay FP8 in VRAM. Pattern follows MAX gemv_split_k for AMD (vectorized
-# K-strip, multi-row tile_n, non-temporal weight loads, warp+block reduce) but
-# with proper FP8→F32 cast (vendored split_k rebinds weight bits to a_type and
-# is unsafe for mixed BF16 acts + FP8 weights).
+# FP8 W8A8 decode (G1b-4): quantize act → FP8 WMMA → dual-scale epilogue
+#
+# RDNA4 has no scalar FP8 dot. Compute is WMMA-only, both operands 8-bit.
+# Weights stay FP8 in the arena (no dequant). Activations: per-token absmax
+# quant to E4M3, pad M=1 → 16×K, WMMA f32.16x16x16.fp8.fp8 (exp3g).
+# Epilogue: C[n] = act_scale * weight_scale[n] * acc[0, n]  (+ residual).
 # ===----------------------------------------------------------------------=== #
 
-comptime FP8 = DType.float8_e4m3fn
+comptime QUANT_TPB = 256
+
+
+def quantize_act_absmax_kernel(
+    a_fp8_ptr: UnsafePointer[Scalar[FP8], MutAnyOrigin],
+    scale_ptr: UnsafePointer[Scalar[F32], MutAnyOrigin],
+    x_ptr: UnsafePointer[Scalar[BF16], ImmutAnyOrigin],
+    k: Int,
+):
+    """Per-token absmax quant of x[0..k) → a_fp8 row 0; zero-pad rows 1..15.
+
+    scale = max(|x|) / FP8_E4M3_MAX.  One block; shared-mem tree reduce.
+    """
+    var tid = Int(thread_idx.x)
+    var sh = stack_allocation[
+        QUANT_TPB, F32, address_space = AddressSpace.SHARED
+    ]()
+
+    # Local absmax.
+    var local = Float32(0)
+    var i = tid
+    while i < k:
+        var v = x_ptr[i].cast[F32]()
+        if v < Float32(0):
+            v = -v
+        if v > local:
+            local = v
+        i += QUANT_TPB
+    sh[tid] = local
+    barrier()
+
+    var stride = QUANT_TPB // 2
+    while stride > 0:
+        if tid < stride:
+            var o = sh[tid + stride]
+            if o > sh[tid]:
+                sh[tid] = o
+        barrier()
+        stride //= 2
+
+    var max_abs = sh[0]
+    var scale = max_abs / FP8_E4M3_MAX
+    # Avoid /0 and under-scale when activation is all zeros.
+    if scale < Float32(1e-12):
+        scale = Float32(1.0)
+    if tid == 0:
+        scale_ptr[0] = scale
+    barrier()
+
+    var inv = Float32(1.0) / scale
+    # Row 0: quantized activation.
+    i = tid
+    while i < k:
+        a_fp8_ptr[i] = (x_ptr[i].cast[F32]() * inv).cast[FP8]()
+        i += QUANT_TPB
+    # Rows 1..15: zeros (WMMA pad).
+    var pad_elems = 15 * k
+    i = tid
+    while i < pad_elems:
+        a_fp8_ptr[k + i] = Scalar[FP8](0)
+        i += QUANT_TPB
+
+
+def quantize_act_fp8_pad(
+    a_fp8: DeviceBuffer[FP8],
+    act_scale: DeviceBuffer[F32],
+    x: TileTensor[mut=False, dtype=BF16, ...],
+    k: Int,
+    ctx: DeviceContext,
+) raises:
+    """Quantize BF16 row x[0,:k] → a_fp8[16,k] pad + act_scale[0]."""
+    ctx.enqueue_function[quantize_act_absmax_kernel](
+        a_fp8.unsafe_ptr().unsafe_mut_cast[True]().as_unsafe_any_origin(),
+        act_scale.unsafe_ptr().unsafe_mut_cast[True]().as_unsafe_any_origin(),
+        x.ptr.as_immutable().as_unsafe_any_origin(),
+        k,
+        grid_dim=(1,),
+        block_dim=(QUANT_TPB,),
+    )
 
 
 def gemv_fp8[
@@ -130,67 +213,31 @@ def gemv_fp8[
     a: TileTensor[mut=False, dtype=BF16, ...],
     w: TileTensor[mut=False, dtype=FP8, ...],
     scale: TileTensor[mut=False, dtype=F32, ...],
+    a_fp8_ws: DeviceBuffer[FP8],
+    act_scale_ws: DeviceBuffer[F32],
     n: Int,
     k: Int,
     ctx: DeviceContext,
+    *,
+    do_quantize: Bool = True,
 ) raises:
-    """C[n] = scale[n] * (W[n,:] · a[0,:])  with W FP8 E4M3, a BF16.
-    If add_residual, C += that product (in-place).
+    """W8A8 decode: quantize a → FP8 WMMA → C[n] = act_s * w_s[n] * (A@W^T)[0,n].
 
-    Uses MAX gemv_kernel_vector with FP8 simd_width + scale epilogue + PDL.
-    Vendored gemv_gpu split-K rebinds weight bits to a_type (unsafe for mixed
-    BF16 acts + FP8 weights). Weights/scales mut=False for exclusivity.
+    No weight dequant. Workspace a_fp8_ws must hold ≥ 16*k FP8 elements.
+    Pass do_quantize=False when a_fp8_ws/act_scale_ws already hold the
+    quantized activation (shared q/k/v or gate/up).
     """
-    var c_ptr = c.ptr.as_unsafe_any_origin()
-    var s_ptr = scale.ptr.as_unsafe_any_origin()
-
-    @always_inline
-    @__copy_capture(c_ptr, s_ptr)
-    @parameter
-    def epilogue[
-        dtype: DType, width: SIMDSize, *, alignment: Int = 1
-    ](idx: IndexList[2], val: SIMD[dtype, width]) -> None:
-        var col = idx[1]
-        var v = val[0].cast[F32]() * s_ptr[col]
-        comptime if add_residual:
-            v = v + c_ptr[col].cast[F32]()
-        c_ptr[col] = v.cast[c_type]()
-
-    comptime sw = simd_width_of[FP8, target=get_gpu_target()]()
-    comptime WARPS_PER_BLOCK = 1024 // WARP_SIZE
-    comptime pdl = PDLLevel.ON
-    var block_dim = min(
-        align_up(k // sw, WARP_SIZE),
-        WARP_SIZE * WARPS_PER_BLOCK,
-    )
-    if block_dim < WARP_SIZE:
-        block_dim = WARP_SIZE
-    comptime kernel = gemv_kernel_vector[
-        c_type,
-        FP8,
-        BF16,
-        type_of(c).LayoutType,
-        type_of(w).LayoutType,
-        type_of(a).LayoutType,
-        type_of(c).Storage,
-        type_of(w).Storage,
-        type_of(a).Storage,
-        simd_width=sw,
-        transpose_b=True,
-        elementwise_lambda_fn=epilogue,
-        check_bounds=True,
-        pdl_level=pdl,
-    ]
-    ctx.enqueue_function[kernel](
+    if do_quantize:
+        quantize_act_fp8_pad(a_fp8_ws, act_scale_ws, a, k, ctx)
+    wmma_gemm_fp8_decode[c_type, add_residual](
         c,
+        a_fp8_ws,
         w,
-        a,
+        scale,
+        act_scale_ws,
         n,
-        1,
         k,
-        grid_dim=ceildiv(n, block_dim // WARP_SIZE),
-        block_dim=block_dim,
-        attributes=pdl_launch_attributes(pdl),
+        ctx,
     )
 
 
@@ -201,18 +248,31 @@ def linear_fp8[
     a: TileTensor[mut=False, dtype=BF16, ...],
     w: TileTensor[mut=False, dtype=FP8, ...],
     scale: TileTensor[mut=False, dtype=F32, ...],
+    a_fp8_ws: DeviceBuffer[FP8],
+    act_scale_ws: DeviceBuffer[F32],
     m: Int,
     n: Int,
     k: Int,
     ctx: DeviceContext,
+    *,
+    do_quantize: Bool = True,
 ) raises:
-    """C = A @ W^T with FP8 weights + per-channel F32 scale.
-    Decode (m=1) uses gemv_fp8. Prefill (m>1) loops gemv over rows (correct,
-    not the prefill performance path)."""
+    """C = A @ W^T via W8A8 FP8 WMMA (decode M=1). Prefill loops per row."""
     if m == 1:
-        gemv_fp8[c_type, False](c, a, w, scale, n, k, ctx)
+        gemv_fp8[c_type, False](
+            c,
+            a,
+            w,
+            scale,
+            a_fp8_ws,
+            act_scale_ws,
+            n,
+            k,
+            ctx,
+            do_quantize=do_quantize,
+        )
         return
-    # Row-at-a-time gemv for short prefill correctness only (not perf path).
+    # Row-at-a-time for short prefill correctness (not the prefill perf path).
     for row in range(m):
         var a_row = TileTensor(
             ptr=a.ptr + row * k, layout=row_major(Coord(Index(1, k)))
@@ -220,7 +280,9 @@ def linear_fp8[
         var c_row = TileTensor(
             ptr=c.ptr + row * n, layout=row_major(Coord(Index(1, n)))
         )
-        gemv_fp8[c_type, False](c_row, a_row, w, scale, n, k, ctx)
+        gemv_fp8[c_type, False](
+            c_row, a_row, w, scale, a_fp8_ws, act_scale_ws, n, k, ctx
+        )
 
 
 def linear_add_residual_fp8(
@@ -228,14 +290,29 @@ def linear_add_residual_fp8(
     a: TileTensor[mut=False, dtype=BF16, ...],
     w: TileTensor[mut=False, dtype=FP8, ...],
     scale: TileTensor[mut=False, dtype=F32, ...],
+    a_fp8_ws: DeviceBuffer[FP8],
+    act_scale_ws: DeviceBuffer[F32],
     m: Int,
     n: Int,
     k: Int,
     ctx: DeviceContext,
+    *,
+    do_quantize: Bool = True,
 ) raises:
-    """residual += A @ W^T (FP8 weights)."""
+    """residual += A @ W^T (W8A8 FP8 WMMA)."""
     if m == 1:
-        gemv_fp8[BF16, True](residual, a, w, scale, n, k, ctx)
+        gemv_fp8[BF16, True](
+            residual,
+            a,
+            w,
+            scale,
+            a_fp8_ws,
+            act_scale_ws,
+            n,
+            k,
+            ctx,
+            do_quantize=do_quantize,
+        )
         return
     for row in range(m):
         var a_row = TileTensor(
@@ -244,7 +321,9 @@ def linear_add_residual_fp8(
         var r_row = TileTensor(
             ptr=residual.ptr + row * n, layout=row_major(Coord(Index(1, n)))
         )
-        gemv_fp8[BF16, True](r_row, a_row, w, scale, n, k, ctx)
+        gemv_fp8[BF16, True](
+            r_row, a_row, w, scale, a_fp8_ws, act_scale_ws, n, k, ctx
+        )
 
 
 def embed_fp8_kernel(

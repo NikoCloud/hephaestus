@@ -18,7 +18,7 @@
 # ===----------------------------------------------------------------------=== #
 
 from std.gpu import barrier, block_idx, thread_idx
-from std.gpu.host import DeviceContext
+from std.gpu.host import DeviceBuffer, DeviceContext
 from std.gpu.memory import AddressSpace
 from std.math import ceildiv
 from std.memory import bitcast, stack_allocation
@@ -269,5 +269,127 @@ def wmma_gemm_bf16_v1[
         n,
         k,
         grid_dim=(n_tiles, m_tiles),
+        block_dim=(WMMA_LANES,),
+    )
+
+
+# ===----------------------------------------------------------------------=== #
+# FP8 E4M3 × FP8 E4M3 → F32 WMMA (W8A8 decode path, G1b-4)
+#
+# Intrinsic (exp3g PASS on gfx1201):
+#   llvm.amdgcn.wmma.f32.16x16x16.fp8.fp8
+#   A/B: SIMD[int32, 2]  = 8 packed FP8 bytes (v2i32)
+#   C/D: SIMD[float32, 8]
+#
+# Lane mappings (G1b-0 geometry, dtype only changes packing):
+#   A-load: a[j] = A_fp8[(l%16)*K + ks + (l/16)*8 + j]   → pack to v2i32
+#   B-load: b[j] = W_fp8[(NB + l%16)*K + ks + (l/16)*8 + j]
+#   D-row0: if (l/16)*8 + j == 0: C[NB + l%16] = scale_act * w_scale[n] * acc[0]
+#
+# Decode pads A to [16, K] (15 zero rows). Grid = ceildiv(N, 16).
+# No FP8→FP32 weight dequant in the K-loop — only WMMA hardware accum.
+# ===----------------------------------------------------------------------=== #
+
+comptime FP8 = DType.float8_e4m3fn
+# FP8 E4M3 finite max (|max| ≈ 448). Used by activation absmax quant.
+comptime FP8_E4M3_MAX = Float32(448.0)
+
+
+@always_inline
+def wmma_fp8(
+    a_i32: SIMD[DType.int32, 2],
+    b_i32: SIMD[DType.int32, 2],
+    c: SIMD[DType.float32, WMMA_FRAG],
+) -> SIMD[DType.float32, WMMA_FRAG]:
+    """Direct llvm.amdgcn.wmma.f32.16x16x16.fp8.fp8 (exp3g arity: 3 operands)."""
+    return llvm_intrinsic[
+        "llvm.amdgcn.wmma.f32.16x16x16.fp8.fp8",
+        SIMD[DType.float32, WMMA_FRAG],
+        has_side_effect=False,
+    ](a_i32, b_i32, c)
+
+
+def wmma_fp8_decode_kernel[
+    c_type: DType, add_residual: Bool
+](
+    a_ptr: UnsafePointer[Scalar[FP8], ImmutAnyOrigin],
+    w_ptr: UnsafePointer[Scalar[FP8], ImmutAnyOrigin],
+    w_scale_ptr: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
+    act_scale_ptr: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
+    c_ptr: UnsafePointer[Scalar[c_type], MutAnyOrigin],
+    N: Int,
+    K: Int,
+):
+    """W8A8 decode: C[n] = act_scale * w_scale[n] * (A_fp8[0,:] · W_fp8[n,:]).
+
+    A is padded [16, K] (row 0 = quantized activation, rows 1..15 = 0).
+    One 16-col N-tile per block; only output row 0 is written.
+    """
+    var l = Int(thread_idx.x)
+    if l >= WMMA_LANES:
+        return
+
+    var n_tile = Int(block_idx.x)
+    var NB = n_tile * WMMA_TILE
+    if NB >= N:
+        return
+
+    var row_or_col = l % WMMA_TILE
+    var half = l // WMMA_TILE
+
+    var acc = SIMD[DType.float32, WMMA_FRAG](0.0)
+    var ks = 0
+    while ks < K:
+        var a_fp8 = SIMD[FP8, WMMA_FRAG](0)
+        var b_fp8 = SIMD[FP8, WMMA_FRAG](0)
+        # A row = l%16 (MB=0); mask not needed — pad rows are zeroed on host path.
+        var a_row_base = row_or_col * K + ks + half * WMMA_FRAG
+        var w_row_base = (NB + row_or_col) * K + ks + half * WMMA_FRAG
+        comptime for j in range(WMMA_FRAG):
+            a_fp8[j] = a_ptr[a_row_base + j]
+            b_fp8[j] = w_ptr[w_row_base + j]
+
+        # Pack 8 FP8 bytes → v2i32 for the intrinsic (LLVM has no native fp8).
+        var a_i32 = bitcast[DType.int32, 2](a_fp8)
+        var b_i32 = bitcast[DType.int32, 2](b_fp8)
+        acc = wmma_fp8(a_i32, b_i32, acc)
+        ks += WMMA_TILE
+
+    # Extract row 0 only: m = half*8 + j == 0 → half==0, j==0.
+    if half == 0:
+        var n = NB + row_or_col
+        if n < N:
+            var s = act_scale_ptr[0] * w_scale_ptr[n]
+            var v = acc[0] * s
+            comptime if add_residual:
+                v = v + c_ptr[n].cast[DType.float32]()
+            c_ptr[n] = v.cast[c_type]()
+
+
+def wmma_gemm_fp8_decode[
+    c_type: DType, add_residual: Bool = False
+](
+    c: TileTensor[mut=True, dtype=c_type, ...],
+    a_fp8: DeviceBuffer[FP8],
+    w: TileTensor[mut=False, dtype=FP8, ...],
+    w_scale: TileTensor[mut=False, dtype = DType.float32, ...],
+    act_scale: DeviceBuffer[DType.float32],
+    n: Int,
+    k: Int,
+    ctx: DeviceContext,
+) raises:
+    """Launch W8A8 decode WMMA: C[n] +=? act_scale * w_scale[n] * (A@W^T)[0,n]."""
+    debug_assert(n % WMMA_TILE == 0, "wmma_gemm_fp8_decode: n must be divisible by 16")
+    debug_assert(k % WMMA_TILE == 0, "wmma_gemm_fp8_decode: k must be divisible by 16")
+    comptime kernel = wmma_fp8_decode_kernel[c_type, add_residual]
+    ctx.enqueue_function[kernel](
+        a_fp8.unsafe_ptr().as_immutable().as_unsafe_any_origin(),
+        w.ptr.as_immutable().as_unsafe_any_origin(),
+        w_scale.ptr.as_immutable().as_unsafe_any_origin(),
+        act_scale.unsafe_ptr().as_immutable().as_unsafe_any_origin(),
+        c.ptr.as_unsafe_any_origin(),
+        n,
+        k,
+        grid_dim=(n // WMMA_TILE,),
         block_dim=(WMMA_LANES,),
     )

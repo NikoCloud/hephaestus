@@ -95,6 +95,11 @@ struct Activations[
     var up: DeviceBuffer[BF16]  # [seq, inter]
     var act: DeviceBuffer[BF16]  # [seq, inter] silu(gate)*up
     var logits: DeviceBuffer[F32]  # [seq, vocab] -- fp32, never bf16
+    # W8A8 decode workspace: padded act [16, K_max] + per-token act scale.
+    # K_max = inter (largest GEMV K: down_proj). q_out used as K for o_proj
+    # is smaller. See quantize_act_fp8_pad / wmma_gemm_fp8_decode.
+    var a_fp8_pad: DeviceBuffer[DType.float8_e4m3fn]
+    var act_scale: DeviceBuffer[F32]
     var max_seq: Int
 
     def __init__(out self, ctx: DeviceContext, max_seq: Int) raises:
@@ -109,6 +114,11 @@ struct Activations[
         self.up = ctx.enqueue_create_buffer[BF16](max_seq * Self.inter)
         self.act = ctx.enqueue_create_buffer[BF16](max_seq * Self.inter)
         self.logits = ctx.enqueue_create_buffer[F32](max_seq * Self.vocab)
+        # 16 rows × max(K) for WMMA pad. inter ≥ q_out ≥ hidden on Qwen3-4B.
+        self.a_fp8_pad = ctx.enqueue_create_buffer[DType.float8_e4m3fn](
+            16 * Self.inter
+        )
+        self.act_scale = ctx.enqueue_create_buffer[F32](1)
         self.max_seq = max_seq
 
 
@@ -310,10 +320,11 @@ def forward_fp8[
     seq: Int,
     ctx: DeviceContext,
 ) raises:
-    """Forward with FP8 E4M3 weights + F32 per-channel scales (decode path).
+    """Forward with FP8 E4M3 weights + W8A8 WMMA decode (G1b-4).
 
-    Embeddings dequant on gather; all projections use linear_fp8 / gemv_fp8
-    (M=1) or row-wise gemv (short prefill). Norms remain BF16.
+    Embeddings dequant on gather (BF16 residual stream). All projections:
+    per-token absmax quant of BF16 act → FP8, pad to 16×K, native
+    llvm.amdgcn.wmma.f32.16x16x16.fp8.fp8, dual-scale epilogue. Norms BF16.
     """
     comptime group = n_heads // n_kv_heads
     var past = cache.length
@@ -354,12 +365,45 @@ def forward_fp8[
             ptr=v_new_ptr, layout=row_major(Coord(Index(seq, kv_out)))
         )
 
-        linear_fp8(q, xn, layer.q_proj, layer.q_proj_scale, seq, q_out, hidden, ctx)
+        # q/k/v share the same xn — quantize once, three WMMA launches.
         linear_fp8(
-            k_dst, xn, layer.k_proj, layer.k_proj_scale, seq, kv_out, hidden, ctx
+            q,
+            xn,
+            layer.q_proj,
+            layer.q_proj_scale,
+            acts.a_fp8_pad,
+            acts.act_scale,
+            seq,
+            q_out,
+            hidden,
+            ctx,
+            do_quantize=True,
         )
         linear_fp8(
-            v_dst, xn, layer.v_proj, layer.v_proj_scale, seq, kv_out, hidden, ctx
+            k_dst,
+            xn,
+            layer.k_proj,
+            layer.k_proj_scale,
+            acts.a_fp8_pad,
+            acts.act_scale,
+            seq,
+            kv_out,
+            hidden,
+            ctx,
+            do_quantize=False,
+        )
+        linear_fp8(
+            v_dst,
+            xn,
+            layer.v_proj,
+            layer.v_proj_scale,
+            acts.a_fp8_pad,
+            acts.act_scale,
+            seq,
+            kv_out,
+            hidden,
+            ctx,
+            do_quantize=False,
         )
 
         _rms_norm(
@@ -406,6 +450,8 @@ def forward_fp8[
             attn_out,
             layer.o_proj,
             layer.o_proj_scale,
+            acts.a_fp8_pad,
+            acts.act_scale,
             seq,
             hidden,
             q_out,
@@ -420,11 +466,32 @@ def forward_fp8[
             hidden,
             ctx,
         )
+        # gate/up share ffn-normed xn — quantize once.
         linear_fp8(
-            gate, xn, layer.gate_proj, layer.gate_proj_scale, seq, inter, hidden, ctx
+            gate,
+            xn,
+            layer.gate_proj,
+            layer.gate_proj_scale,
+            acts.a_fp8_pad,
+            acts.act_scale,
+            seq,
+            inter,
+            hidden,
+            ctx,
+            do_quantize=True,
         )
         linear_fp8(
-            up, xn, layer.up_proj, layer.up_proj_scale, seq, inter, hidden, ctx
+            up,
+            xn,
+            layer.up_proj,
+            layer.up_proj_scale,
+            acts.a_fp8_pad,
+            acts.act_scale,
+            seq,
+            inter,
+            hidden,
+            ctx,
+            do_quantize=False,
         )
         silu_mul(
             acts.act.unsafe_ptr().as_unsafe_any_origin(),
@@ -434,7 +501,16 @@ def forward_fp8[
             ctx,
         )
         linear_add_residual_fp8(
-            x, act, layer.down_proj, layer.down_proj_scale, seq, hidden, inter, ctx
+            x,
+            act,
+            layer.down_proj,
+            layer.down_proj_scale,
+            acts.a_fp8_pad,
+            acts.act_scale,
+            seq,
+            hidden,
+            inter,
+            ctx,
         )
 
     _rms_norm(
@@ -446,13 +522,13 @@ def forward_fp8[
         ctx,
     )
     var logits = TileTensor(acts.logits, row_major(Coord(Index(seq, vocab))))
-    linear_fp8[
-        F32
-    ](
+    linear_fp8[F32](
         logits,
         xn,
         weights.embed_tokens,
         weights.embed_scale,
+        acts.a_fp8_pad,
+        acts.act_scale,
         seq,
         vocab,
         hidden,
