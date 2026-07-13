@@ -1,0 +1,16 @@
+/tmp/exp3c_bf16_frag8.mojo:1:1: error: failed to run the pass manager for offload functions
+# RDNA4-shaped BF16 fragments (size 8) — may fail at type-check if API requires 16
+/tmp/exp3c_bf16_frag8.mojo:5:5: error: function instantiation failed
+def wmma_probe(out_ptr: UnsafePointer[Float32, MutAnyOrigin]):
+    ^
+/tmp/exp3c_bf16_frag8.mojo:10:8: note: call expansion failed
+    mma(d, a, b, c)
+       ^
+oss/modular/mojo/stdlib/std/gpu/compute/mma.mojo:226:29: note: call expansion failed with parameter value(s): ("block_size": 1, ..., "d.size`1": 8, ..., "a.size`4": 8, ..., "b.size`6": 8, ..., "c.size`8": 8)
+oss/modular/mojo/stdlib/std/gpu/compute/arch/mma_amd.mojo:56:5: note: function instantiation failed
+oss/modular/mojo/stdlib/std/gpu/compute/arch/mma_amd.mojo:59:23: note: call expansion failed with parameter value(s): (..., "d.size`1": 8, ..., "a.size`4": 8, ..., "b.size`6": 8, ..., "c.size`8": 8)
+oss/modular/mojo/stdlib/std/gpu/compute/arch/mma_amd_rdna.mojo:249:5: note: function instantiation failed
+oss/modular/mojo/stdlib/std/gpu/compute/arch/mma_amd_rdna.mojo:357:9: note: function instantiation failed
+oss/modular/mojo/stdlib/std/gpu/compute/arch/mma_amd_rdna.mojo:376:36: note: call expansion failed
+oss/modular/mojo/stdlib/std/gpu/compute/mma.mojo:87:5: note: constraint failed: no valid implementation of mma for a=8xbfloat16, b=8xbfloat16, c=8xfloat32, and d=8xfloat32
+/home/nikocloud/projects/hephaestus-wmma-nightly/.pixi/envs/default/bin/mojo: error: failed to run the pass manager

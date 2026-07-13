@@ -1,0 +1,3 @@
+decode M=1  gemv_gpu -> errors: 0 / 4096  max_diff: 0.0312109
+prefill M=4 naive -> errors: 0 / 16384  max_diff: 0.031246185
+EXP3e PASS: both WMMA-free paths compile and are correct on gfx1201

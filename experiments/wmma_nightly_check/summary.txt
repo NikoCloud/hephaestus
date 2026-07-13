@@ -1,0 +1,150 @@
+=== toolchain ===
+Mojo 1.0.0b3.dev2026071206 (83d74d94)
+max-core              26.5.0.dev2026071206   release                 94.73 MiB  [32mconda[0m  https://conda.modular.com/max-nightly
+mojo-compiler         1.0.0b3.dev2026071206  release                 77.74 MiB  [32mconda[0m  https://conda.modular.com/max-nightly
+mojo-python           1.0.0b3.dev2026071206  release                 23.54 KiB  [32mconda[0m  https://conda.modular.com/max-nightly
+
+=== exp3c_wmma_bf16 ===
+BUILD FAIL rc=134
+LLVM ERROR: Cannot select: intrinsic %llvm.amdgcn.wmma.f32.16x16x16.bf16
+Please submit a bug report to https://github.com/modular/modular/issues and include the crash backtrace along with all the relevant source codes.
+Stack dump:
+0.	Running pass 'CallGraph Pass Manager' on module 'exp3c_wmma_probe.mojo'.
+1.	Running pass 'AMDGPU DAG->DAG Pattern Instruction Selection' on function '@exp3c_wmma_probe_wmma_probe_U6A6AoA6A6A_e8d2e1bb98128154'
+[2479765:2479766:20260712,210734.549341:ERROR directory_reader_posix.cc:42] opendir /home/nikocloud/projects/hephaestus-wmma-nightly/.pixi/envs/default/share/max/crashdb/attachments/4d90540e-7c53-4792-ab89-bbdf8d8a1787: No such file or directory (2)
+ #0 0x000056210c019b3e (/home/nikocloud/projects/hephaestus-wmma-nightly/.pixi/envs/default/bin/mojo+0x82c0b3e)
+ #1 0x000056210c016b9e (/home/nikocloud/projects/hephaestus-wmma-nightly/.pixi/envs/default/bin/mojo+0x82bdb9e)
+ #2 0x000056210c01a930 (/home/nikocloud/projects/hephaestus-wmma-nightly/.pixi/envs/default/bin/mojo+0x82c1930)
+ #3 0x00007f441c6448f0 (/usr/lib/libc.so.6+0x448f0)
+ #4 0x00007f441c74751d syscall (/usr/lib/libc.so.6+0x14751d)
+ #5 0x00007f441ff82eec (/home/nikocloud/projects/hephaestus-wmma-nightly/.pixi/envs/default/bin/../lib/libAsyncRTMojoBindings.so+0xf9eec)
+ #6 0x00007f441c6448f0 (/usr/lib/libc.so.6+0x448f0)
+ #7 0x00007f441c6adcbb pthread_kill (/usr/lib/libc.so.6+0xadcbb)
+ #8 0x00007f441c6447c8 raise (/usr/lib/libc.so.6+0x447c8)
+ #9 0x00007f441c6257b5 abort (/usr/lib/libc.so.6+0x257b5)
+#10 0x000056210bfdaac9 (/home/nikocloud/projects/hephaestus-wmma-nightly/.pixi/envs/default/bin/mojo+0x8281ac9)
+#11 0x000056210aaa67a4 (/home/nikocloud/projects/hephaestus-wmma-nightly/.pixi/envs/default/bin/mojo+0x6d4d7a4)
+#12 0x000056210aaa5ec6 (/home/nikocloud/projects/hephaestus-wmma-nightly/.pixi/envs/default/bin/mojo+0x6d4cec6)
+#13 0x0000562109628c17 (/home/nikocloud/projects/hephaestus-wmma-nightly/.pixi/envs/default/bin/mojo+0x58cfc17)
+#14 0x000056210aa9d39c (/home/nikocloud/projects/hephaestus-wmma-nightly/.pixi/envs/default/bin/mojo+0x6d4439c)
+#15 0x000056210aa9ca98 (/home/nikocloud/projects/hephaestus-wmma-nightly/.pixi/envs/default/bin/mojo+0x6d43a98)
+#16 0x000056210aa9c274 (/home/nikocloud/projects/hephaestus-wmma-nightly/.pixi/envs/default/bin/mojo+0x6d43274)
+#17 0x000056210aa9a0b5 (/home/nikocloud/projects/hephaestus-wmma-nightly/.pixi/envs/default/bin/mojo+0x6d410b5)
+#18 0x0000562109623bb7 (/home/nikocloud/projects/hephaestus-wmma-nightly/.pixi/envs/default/bin/mojo+0x58cabb7)
+#19 0x000056210aa98360 (/home/nikocloud/projects/hephaestus-wmma-nightly/.pixi/envs/default/bin/mojo+0x6d3f360)
+#20 0x000056210a71e8f6 (/home/nikocloud/projects/hephaestus-wmma-nightly/.pixi/envs/default/bin/mojo+0x69c58f6)
+#21 0x000056210beb0d2f (/home/nikocloud/projects/hephaestus-wmma-nightly/.pixi/envs/default/bin/mojo+0x8157d2f)
+#22 0x000056210b7a1784 (/home/nikocloud/projects/hephaestus-wmma-nightly/.pixi/envs/default/bin/mojo+0x7a48784)
+#23 0x000056210beb1891 (/home/nikocloud/projects/hephaestus-wmma-nightly/.pixi/envs/default/bin/mojo+0x8158891)
+#24 0x0000562107e72c92 (/home/nikocloud/projects/hephaestus-wmma-nightly/.pixi/envs/default/bin/mojo+0x4119c92)
+#25 0x0000562107e79eba (/home/nikocloud/projects/hephaestus-wmma-nightly/.pixi/envs/default/bin/mojo+0x4120eba)
+#26 0x0000562107e7cc9f (/home/nikocloud/projects/hephaestus-wmma-nightly/.pixi/envs/default/bin/mojo+0x4123c9f)
+#27 0x0000562107e799d3 (/home/nikocloud/projects/hephaestus-wmma-nightly/.pixi/envs/default/bin/mojo+0x41209d3)
+#28 0x00007f441ff3f18b (/home/nikocloud/projects/hephaestus-wmma-nightly/.pixi/envs/default/bin/../lib/libAsyncRTMojoBindings.so+0xb618b)
+#29 0x00007f441ff3ecd5 (/home/nikocloud/projects/hephaestus-wmma-nightly/.pixi/envs/default/bin/../lib/libAsyncRTMojoBindings.so+0xb5cd5)
+#30 0x00007f441c6aba58 (/usr/lib/libc.so.6+0xaba58)
+#31 0x00007f441c749fdc (/usr/lib/libc.so.6+0x149fdc)
+
+=== exp3f_wmma_fp8 ===
+BUILD FAIL rc=134
+[2479887:2479888:20260712,210737.091975:ERROR file_io_posix.cc:152] open /home/nikocloud/projects/hephaestus-wmma-nightly/.pixi/envs/default/share/max/crashdb/pending/4d90540e-7c53-4792-ab89-bbdf8d8a1787.lock: File exists (17)
+LLVM ERROR: Do not know how to split this operator's operand!
+
+Please submit a bug report to https://github.com/modular/modular/issues and include the crash backtrace along with all the relevant source codes.
+Stack dump:
+0.	Program arguments: /home/nikocloud/projects/hephaestus-wmma-nigh[2479887:2479888:20260712,210738.747754:ERROR directory_reader_posix.cc:42] opendir /home/nikocloud/projects/hephaestus-wmma-nightly/.pixi/envs/default/share/max/crashdb/attachments/4fe00e23-8bee-4458-883d-5de0a92586a7: No such file or directory (2)
+tly/.pixi/envs/default/bin/mojo build /home/nikocloud/projects/hephaestus/experiments/exp3f_fp8_wmma_probe.mojo -o /tmp/exp3f_wmma_fp8_bin
+1.	Running pass 'CallGraph Pass Manager' on module 'exp3f_fp8_wmma_probe.mojo'.
+2.	Running pass 'AMDGPU DAG->DAG Pattern Instruction Selection' on function '@exp3f_fp8_wmma_probe_fp8_wmma_p6A6A_b807dc2906782c4b'
+ #0 0x0000564fcef90b3e (/home/nikocloud/projects/hephaestus-wmma-nightly/.pixi/envs/default/bin/mojo+0x82c0b3e)
+ #1 0x0000564fcef8db9e (/home/nikocloud/projects/hephaestus-wmma-nightly/.pixi/envs/default/bin/mojo+0x82bdb9e)
+ #2 0x0000564fcef91930 (/home/nikocloud/projects/hephaestus-wmma-nightly/.pixi/envs/default/bin/mojo+0x82c1930)
+ #3 0x00007efcb62448f0 (/usr/lib/libc.so.6+0x448f0)
+ #4 0x00007efcb634751d syscall (/usr/lib/libc.so.6+0x14751d)
+ #5 0x00007efcb8bcdeec (/home/nikocloud/projects/hephaestus-wmma-nightly/.pixi/envs/default/bin/../lib/libAsyncRTMojoBindings.so+0xf9eec)
+ #6 0x00007efcb62448f0 (/usr/lib/libc.so.6+0x448f0)
+ #7 0x00007efcb62adcbb pthread_kill (/usr/lib/libc.so.6+0xadcbb)
+ #8 0x00007efcb62447c8 raise (/usr/lib/libc.so.6+0x447c8)
+ #9 0x00007efcb62257b5 abort (/usr/lib/libc.so.6+0x257b5)
+#10 0x0000564fcef51ac9 (/home/nikocloud/projects/hephaestus-wmma-nightly/.pixi/envs/default/bin/mojo+0x8281ac9)
+#11 0x0000564fcef518f9 (/home/nikocloud/projects/hephaestus-wmma-nightly/.pixi/envs/default/bin/mojo+0x82818f9)
+#12 0x0000564fcda8abf1 (/home/nikocloud/projects/hephaestus-wmma-nightly/.pixi/envs/default/bin/mojo+0x6dbabf1)
+#13 0x0000564fcda40b62 (/home/nikocloud/projects/hephaestus-wmma-nightly/.pixi/envs/default/bin/mojo+0x6d70b62)
+#14 0x0000564fcda4462d (/home/nikocloud/projects/hephaestus-wmma-nightly/.pixi/envs/default/bin/mojo+0x6d7462d)
+#15 0x0000564fcda136ab (/home/nikocloud/projects/hephaestus-wmma-nightly/.pixi/envs/default/bin/mojo+0x6d436ab)
+#16 0x0000564fcda13274 (/home/nikocloud/projects/hephaestus-wmma-nightly/.pixi/envs/default/bin/mojo+0x6d43274)
+#17 0x0000564fcda110b5 (/home/nikocloud/projects/hephaestus-wmma-nightly/.pixi/envs/default/bin/mojo+0x6d410b5)
+#18 0x0000564fcc59abb7 (/home/nikocloud/projects/hephaestus-wmma-nightly/.pixi/envs/default/bin/mojo+0x58cabb7)
+#19 0x0000564fcda0f360 (/home/nikocloud/projects/hephaestus-wmma-nightly/.pixi/envs/default/bin/mojo+0x6d3f360)
+#20 0x0000564fcd6958f6 (/home/nikocloud/projects/hephaestus-wmma-nightly/.pixi/envs/default/bin/mojo+0x69c58f6)
+#21 0x0000564fcee27d2f (/home/nikocloud/projects/hephaestus-wmma-nightly/.pixi/envs/default/bin/mojo+0x8157d2f)
+#22 0x0000564fce718784 (/home/nikocloud/projects/hephaestus-wmma-nightly/.pixi/envs/default/bin/mojo+0x7a48784)
+#23 0x0000564fcee28891 (/home/nikocloud/projects/hephaestus-wmma-nightly/.pixi/envs/default/bin/mojo+0x8158891)
+#24 0x0000564fcade9c92 (/home/nikocloud/projects/hephaestus-wmma-nightly/.pixi/envs/default/bin/mojo+0x4119c92)
+#25 0x0000564fcadf0eba (/home/nikocloud/projects/hephaestus-wmma-nightly/.pixi/envs/default/bin/mojo+0x4120eba)
+#26 0x0000564fcadf3c9f (/home/nikocloud/projects/hephaestus-wmma-nightly/.pixi/envs/default/bin/mojo+0x4123c9f)
+#27 0x0000564fcadf09d3 (/home/nikocloud/projects/hephaestus-wmma-nightly/.pixi/envs/default/bin/mojo+0x41209d3)
+#28 0x00007efcb8b8c6a3 (/home/nikocloud/projects/hephaestus-wmma-nightly/.pixi/envs/default/bin/../lib/libAsyncRTMojoBindings.so+0xb86a3)
+#29 0x00007efcb8b898f6 (/home/nikocloud/projects/hephaestus-wmma-nightly/.pixi/envs/default/bin/../lib/libAsyncRTMojoBindings.so+0xb58f6)
+#30 0x0000564fcaddbf3b (/home/nikocloud/projects/hephaestus-wmma-nightly/.pixi/envs/default/bin/mojo+0x410bf3b)
+#31 0x0000564fcae55936 (/home/nikocloud/projects/hephaestus-wmma-nightly/.pixi/envs/default/bin/mojo+0x4185936)
+#32 0x0000564fcaee7e15 (/home/nikocloud/projects/hephaestus-wmma-nightly/.pixi/envs/default/bin/mojo+0x4217e15)
+#33 0x0000564fcaef7893 (/home/nikocloud/projects/hephaestus-wmma-nightly/.pixi/envs/default/bin/mojo+0x4227893)
+#34 0x0000564fce67ab5b (/home/nikocloud/projects/hephaestus-wmma-nightly/.pixi/envs/default/bin/mojo+0x79aab5b)
+#35 0x0000564fce67d740 (/home/nikocloud/projects/hephaestus-wmma-nightly/.pixi/envs/default/bin/mojo+0x79ad740)
+#36 0x0000564fcb47e418 (/home/nikocloud/projects/hephaestus-wmma-nightly/.pixi/envs/default/bin/mojo+0x47ae418)
+#37 0x0000564fcade06e3 (/home/nikocloud/projects/hephaestus-wmma-nightly/.pixi/envs/default/bin/mojo+0x41106e3)
+#38 0x0000564fcb47e103 (/home/nikocloud/projects/hephaestus-wmma-nightly/.pixi/envs/default/bin/mojo+0x47ae103)
+#39 0x0000564fcb47dd18 (/home/nikocloud/projects/hephaestus-wmma-nightly/.pixi/envs/default/bin/mojo+0x47add18)
+#40 0x00007efcb8b8c491 (/home/nikocloud/projects/hephaestus-wmma-nightly/.pixi/envs/default/bin/../lib/libAsyncRTMojoBindings.so+0xb8491)
+#41 0x00007efcb8b898f6 (/home/nikocloud/projects/hephaestus-wmma-nightly/.pixi/envs/default/bin/../lib/libAsyncRTMojoBindings.so+0xb58f6)
+#42 0x0000564fcae590e3 (/home/nikocloud/projects/hephaestus-wmma-nightly/.pixi/envs/default/bin/mojo+0x41890e3)
+#43 0x0000564fcae5879d (/home/nikocloud/projects/hephaestus-wmma-nightly/.pixi/envs/default/bin/mojo+0x418879d)
+#44 0x0000564fcab92511 (/home/nikocloud/projects/hephaestus-wmma-nightly/.pixi/envs/default/bin/mojo+0x3ec2511)
+#45 0x0000564fcab8f687 (/home/nikocloud/projects/hephaestus-wmma-nightly/.pixi/envs/default/bin/mojo+0x3ebf687)
+#46 0x00007efcb6227c8e (/usr/lib/libc.so.6+0x27c8e)
+#47 0x00007efcb6227dcb __libc_start_main (/usr/lib/libc.so.6+0x27dcb)
+#48 0x0000564fcab8efe5 (/home/nikocloud/projects/hephaestus-wmma-nightly/.pixi/envs/default/bin/mojo+0x3ebefe5)
+
+=== exp3e_wmma_free ===
+BUILD FAIL rc=1
+/home/nikocloud/projects/hephaestus/experiments/exp3e_wmma_free_paths.mojo:80:31: error: invalid call to 'check': value passed to 'hc' cannot be converted from 'UnsafePointer[BFloat16, MutUntrackedOrigin]' to 'UnsafePointer[BFloat16, MutAnyOrigin]'
+        check[1](hc.unsafe_ptr(), host_a1, host_b, "decode M=1  gemv_gpu")
+        ~~~~~    ~~~~~~~~~~~~~^~
+/home/nikocloud/projects/hephaestus/experiments/exp3e_wmma_free_paths.mojo:29:5: note: function declared here
+def check[M: Int](
+    ^
+/home/nikocloud/projects/hephaestus/experiments/exp3e_wmma_free_paths.mojo:80:31: note: .origin of the first value is 'MutUntrackedOrigin' but the second value is 'MutAnyOrigin'
+        check[1](hc.unsafe_ptr(), host_a1, host_b, "decode M=1  gemv_gpu")
+                              ^
+/home/nikocloud/projects/hephaestus/experiments/exp3e_wmma_free_paths.mojo:124:31: error: invalid call to 'check': value passed to 'hc' cannot be converted from 'UnsafePointer[BFloat16, MutUntrackedOrigin]' to 'UnsafePointer[BFloat16, MutAnyOrigin]'
+        check[M](hc.unsafe_ptr(), host_a4, host_b, "prefill M=4 naive")
+        ~~~~~    ~~~~~~~~~~~~~^~
+/home/nikocloud/projects/hephaestus/experiments/exp3e_wmma_free_paths.mojo:29:5: note: function declared here
+def check[M: Int](
+    ^
+/home/nikocloud/projects/hephaestus/experiments/exp3e_wmma_free_paths.mojo:124:31: note: .origin of the first value is 'MutUntrackedOrigin' but the second value is 'MutAnyOrigin'
+        check[M](hc.unsafe_ptr(), host_a4, host_b, "prefill M=4 naive")
+                              ^
+/home/nikocloud/projects/hephaestus-wmma-nightly/.pixi/envs/default/bin/mojo: error: failed to parse the provided Mojo source module
+
+=== exp3c_bf16_frag8 ===
+BUILD FAIL rc=1
+/tmp/exp3c_bf16_frag8.mojo:1:1: error: failed to run the pass manager for offload functions
+# RDNA4-shaped BF16 fragments (size 8) — may fail at type-check if API requires 16
+/tmp/exp3c_bf16_frag8.mojo:5:5: error: function instantiation failed
+def wmma_probe(out_ptr: UnsafePointer[Float32, MutAnyOrigin]):
+    ^
+/tmp/exp3c_bf16_frag8.mojo:10:8: note: call expansion failed
+    mma(d, a, b, c)
+       ^
+oss/modular/mojo/stdlib/std/gpu/compute/mma.mojo:226:29: note: call expansion failed with parameter value(s): ("block_size": 1, ..., "d.size`1": 8, ..., "a.size`4": 8, ..., "b.size`6": 8, ..., "c.size`8": 8)
+oss/modular/mojo/stdlib/std/gpu/compute/arch/mma_amd.mojo:56:5: note: function instantiation failed
+oss/modular/mojo/stdlib/std/gpu/compute/arch/mma_amd.mojo:59:23: note: call expansion failed with parameter value(s): (..., "d.size`1": 8, ..., "a.size`4": 8, ..., "b.size`6": 8, ..., "c.size`8": 8)
+oss/modular/mojo/stdlib/std/gpu/compute/arch/mma_amd_rdna.mojo:249:5: note: function instantiation failed
+oss/modular/mojo/stdlib/std/gpu/compute/arch/mma_amd_rdna.mojo:357:9: note: function instantiation failed
+oss/modular/mojo/stdlib/std/gpu/compute/arch/mma_amd_rdna.mojo:376:36: note: call expansion failed
+oss/modular/mojo/stdlib/std/gpu/compute/mma.mojo:87:5: note: constraint failed: no valid implementation of mma for a=8xbfloat16, b=8xbfloat16, c=8xfloat32, and d=8xfloat32
+/home/nikocloud/projects/hephaestus-wmma-nightly/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+
+=== done 2026-07-12T21:07:43-04:00 ===
