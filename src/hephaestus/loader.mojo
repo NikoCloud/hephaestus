@@ -309,7 +309,13 @@ def _dtype_width(dtype: String) raises -> Int:
 
 
 def load_arena_bytes(ctx: DeviceContext, prefix: String) raises -> WeightArenaBytes:
-    """Load mixed-dtype staged blob into a uint8 device arena."""
+    """Load mixed-dtype staged blob into a uint8 device arena.
+
+    After upload, FP8 projection weights (all F8_E4M3 tensors except
+    embed_tokens) are rearranged into WMMA-fragment order so the decode
+    B-load is a single coalesced 8-byte/lane read. Embed stays row-major
+    for gather-based embedding lookup; lm_head uses the unswizzled path.
+    """
     var entries = parse_offsets(prefix + ".offsets")
     var index = Dict[String, Int]()
     var total_bytes = 0
@@ -351,9 +357,116 @@ def load_arena_bytes(ctx: DeviceContext, prefix: String) raises -> WeightArenaBy
                 raise Error("round-trip mismatch at byte " + String(done + i))
         done += this_chunk
     f.close()
-    return WeightArenaBytes(
+
+    var arena = WeightArenaBytes(
         buf=dev^, entries=entries^, index=index^, total_bytes=total_bytes
     )
+    # Set False to keep row-major weights (debug / A-B vs swizzled).
+    comptime DO_FP8_WMMA_SWIZZLE = True
+    comptime if DO_FP8_WMMA_SWIZZLE:
+        swizzle_fp8_projection_weights(ctx, arena)
+    return arena^
+
+
+# ===----------------------------------------------------------------------=== #
+# WMMA-fragment-order swizzle for FP8 projection weights
+#
+# B-fragment mapping (G1b-0):
+#   b[j] = W[(NB + l%16)*K + ks + (l/16)*8 + j]
+# Row-major stores force 16 scattered row reads. Swizzled layout packs each
+# 16×16 tile so lane l reads bytes [l*8 .. l*8+7] contiguously:
+#   swizzled[n_tile*(K/16)*256 + k_tile*256 + l*8 + j] = that B element
+# ===----------------------------------------------------------------------=== #
+
+
+def _swizzle_fp8_matrix_host(
+    dst: UnsafePointer[Scalar[DType.uint8], MutAnyOrigin],
+    src: UnsafePointer[Scalar[DType.uint8], ImmutAnyOrigin],
+    N: Int,
+    K: Int,
+) raises:
+    """Host: row-major [N,K] FP8 → fragment-order [N/16, K/16, 256]."""
+    if N % 16 != 0 or K % 16 != 0:
+        raise Error("swizzle_fp8: N and K must be multiples of 16")
+    var n_tiles = N // 16
+    var k_tiles = K // 16
+    for nt in range(n_tiles):
+        for kt in range(k_tiles):
+            var tile_base = (nt * k_tiles + kt) * 256
+            for lane in range(32):
+                var row = lane % 16
+                var half = lane // 16
+                for j in range(8):
+                    var col = half * 8 + j
+                    var src_idx = (nt * 16 + row) * K + kt * 16 + col
+                    dst[tile_base + lane * 8 + j] = src[src_idx]
+
+
+def swizzle_fp8_projection_weights(
+    ctx: DeviceContext, mut arena: WeightArenaBytes
+) raises:
+    """In-place swizzle of every F8_E4M3 2D weight except embed_tokens.
+
+    embed_tokens stays row-major for gather embedding; lm_head uses the
+    unswizzled B-load path. All other FP8 mats are WMMA B operands.
+    """
+    # Max F8 tensor we touch (exclude embed which can be ~389MB).
+    var max_bytes = 0
+    for e in arena.entries:
+        if e.dtype != "F8_E4M3" and e.dtype != "F8E4M3":
+            continue
+        if e.name == "model.embed_tokens.weight":
+            continue
+        if e.byte_size > max_bytes:
+            max_bytes = e.byte_size
+    if max_bytes == 0:
+        return
+
+    var host_src = ctx.enqueue_create_host_buffer[DType.uint8](max_bytes)
+    var host_dst = ctx.enqueue_create_host_buffer[DType.uint8](max_bytes)
+    ctx.synchronize()
+    var n_swizzled = 0
+    for e in arena.entries:
+        if e.dtype != "F8_E4M3" and e.dtype != "F8E4M3":
+            continue
+        if e.name == "model.embed_tokens.weight":
+            continue
+        if len(e.shape) != 2:
+            raise Error("FP8 weight not rank-2: " + e.name)
+        var N = e.shape[0]
+        var K = e.shape[1]
+        if N % 16 != 0 or K % 16 != 0:
+            raise Error(
+                "FP8 weight dims not tile-aligned: "
+                + e.name
+                + " "
+                + String(N)
+                + "x"
+                + String(K)
+            )
+        if e.byte_size != N * K:
+            raise Error("FP8 byte_size mismatch: " + e.name)
+
+        # Device → host (row-major)
+        ctx.enqueue_copy(
+            host_src.unsafe_ptr(),
+            arena.buf.unsafe_ptr() + e.byte_offset,
+            e.byte_size,
+        )
+        ctx.synchronize()
+        # HostBuffer.ptr is mutable; cast origins for the swizzle helper.
+        var dst_ptr = host_dst.unsafe_ptr().as_unsafe_any_origin()
+        var src_ptr = host_src.unsafe_ptr().as_immutable().as_unsafe_any_origin()
+        _swizzle_fp8_matrix_host(dst_ptr, src_ptr, N, K)
+        # Host → device (fragment order)
+        ctx.enqueue_copy(
+            arena.buf.unsafe_ptr() + e.byte_offset,
+            host_dst.unsafe_ptr(),
+            e.byte_size,
+        )
+        ctx.synchronize()
+        n_swizzled += 1
+    print("swizzled", n_swizzled, "FP8 projection tensors into WMMA-fragment order")
 
 
 def _byte_offset(arena: WeightArenaBytes, name: String) raises -> Int:

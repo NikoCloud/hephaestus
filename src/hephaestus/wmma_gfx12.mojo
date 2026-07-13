@@ -274,6 +274,8 @@ def wmma_gemm_bf16_v1[
 
 
 # ===----------------------------------------------------------------------=== #
+
+# ===----------------------------------------------------------------------=== #
 # FP8 E4M3 × FP8 E4M3 → F32 WMMA (W8A8 decode path, G1b-4)
 #
 # Intrinsic (exp3g PASS on gfx1201):
@@ -281,13 +283,16 @@ def wmma_gemm_bf16_v1[
 #   A/B: SIMD[int32, 2]  = 8 packed FP8 bytes (v2i32)
 #   C/D: SIMD[float32, 8]
 #
-# Lane mappings (G1b-0 geometry, dtype only changes packing):
-#   A-load: a[j] = A_fp8[(l%16)*K + ks + (l/16)*8 + j]   → pack to v2i32
-#   B-load: b[j] = W_fp8[(NB + l%16)*K + ks + (l/16)*8 + j]
-#   D-row0: if (l/16)*8 + j == 0: C[NB + l%16] = scale_act * w_scale[n] * acc[0]
+# Lane mappings (G1b-0 geometry):
+#   A-load (row-major pad): a[j] = A[(l%16)*K + ks + (l/16)*8 + j]
+#   B-load (SWIZZLED weights — default):
+#     tile_base = n_tile*(K/16)*256 + k_tile*256
+#     b[j] = W_swz[tile_base + l*8 + j]   # coalesced: consecutive lanes, +8B
+#   B-load (row-major, embed/lm_head only):
+#     b[j] = W[(NB + l%16)*K + ks + (l/16)*8 + j]
+#   D-row0: half==0 → C[NB + l%16] = scale_act * w_scale[n] * acc[0]
 #
-# Decode pads A to [16, K] (15 zero rows). Grid = ceildiv(N, 16).
-# No FP8→FP32 weight dequant in the K-loop — only WMMA hardware accum.
+# No LDS: M=1 has no reuse; barriers regressed. Swizzle coalesces without LDS.
 # ===----------------------------------------------------------------------=== #
 
 comptime FP8 = DType.float8_e4m3fn
@@ -309,18 +314,8 @@ def wmma_fp8(
     ](a_i32, b_i32, c)
 
 
-# USE_LDS=True: BF16-v2 style cooperative global→LDS per 16-K strip.
-# Measured (R9700 decode, 10×256): direct-global ~56.6 tok/s; LDS-v2 ~36.9;
-# multi-strip LDS ~19. Decode has no LDS reuse (each element read once), so
-# barriers dominate. Keep LDS path as the thesis-aligned staging pattern;
-# set False to recover the faster direct-global path for co-measure.
-# Thesis request: LDS-stage weights. Direct-global is faster on decode
-# (~56 vs ~37 tok/s) — flip to False for the faster path; see bench writeup.
-comptime FP8_DECODE_USE_LDS = True
-
-
 def wmma_fp8_decode_kernel[
-    c_type: DType, add_residual: Bool
+    c_type: DType, add_residual: Bool, swizzled_b: Bool
 ](
     a_ptr: UnsafePointer[Scalar[FP8], ImmutAnyOrigin],
     w_ptr: UnsafePointer[Scalar[FP8], ImmutAnyOrigin],
@@ -332,8 +327,8 @@ def wmma_fp8_decode_kernel[
 ):
     """W8A8 decode: C[n] = act_scale * w_scale[n] * (A@W^T)[0,n].
 
-    Default: direct-global fragment loads (G1b-0). Optional LDS path
-    (FP8_DECODE_USE_LDS) mirrors BF16 v2 cooperative staging.
+    swizzled_b=True: projection weights in fragment order (coalesced B-load).
+    swizzled_b=False: row-major B (embed/lm_head only).
     """
     var l = Int(thread_idx.x)
     if l >= WMMA_LANES:
@@ -346,54 +341,36 @@ def wmma_fp8_decode_kernel[
 
     var row_or_col = l % WMMA_TILE
     var half = l // WMMA_TILE
+    var k_tiles = K // WMMA_TILE
     var acc = SIMD[DType.float32, WMMA_FRAG](0.0)
 
-    comptime if FP8_DECODE_USE_LDS:
-        var A_lds = stack_allocation[
-            WMMA_TILE * LDS_STRIDE, FP8, address_space = AddressSpace.SHARED
-        ]()
-        var B_lds = stack_allocation[
-            WMMA_TILE * LDS_STRIDE, FP8, address_space = AddressSpace.SHARED
-        ]()
-        var ks = 0
-        while ks < K:
-            comptime for i in range(8):
-                var row = i * 2 + half
-                var col = row_or_col
-                var lds_idx = row * LDS_STRIDE + col
-                A_lds[lds_idx] = a_ptr[row * K + ks + col]
-                B_lds[lds_idx] = w_ptr[(NB + row) * K + ks + col]
-            barrier()
-            var a_fp8 = SIMD[FP8, WMMA_FRAG](0)
-            var b_fp8 = SIMD[FP8, WMMA_FRAG](0)
-            var frag_base = row_or_col * LDS_STRIDE + half * WMMA_FRAG
-            comptime for j in range(WMMA_FRAG):
-                a_fp8[j] = A_lds[frag_base + j]
-                b_fp8[j] = B_lds[frag_base + j]
-            acc = wmma_fp8(
-                bitcast[DType.int32, 2](a_fp8),
-                bitcast[DType.int32, 2](b_fp8),
-                acc,
-            )
-            barrier()
-            ks += WMMA_TILE
-    else:
-        # Direct-global (faster on decode: no barrier tax, no LDS reuse).
-        var ks2 = 0
-        while ks2 < K:
-            var a_fp8 = SIMD[FP8, WMMA_FRAG](0)
-            var b_fp8 = SIMD[FP8, WMMA_FRAG](0)
-            var a_row_base = row_or_col * K + ks2 + half * WMMA_FRAG
-            var w_row_base = (NB + row_or_col) * K + ks2 + half * WMMA_FRAG
-            comptime for j in range(WMMA_FRAG):
-                a_fp8[j] = a_ptr[a_row_base + j]
-                b_fp8[j] = w_ptr[w_row_base + j]
-            acc = wmma_fp8(
-                bitcast[DType.int32, 2](a_fp8),
-                bitcast[DType.int32, 2](b_fp8),
-                acc,
-            )
-            ks2 += WMMA_TILE
+    var ks = 0
+    var k_tile = 0
+    # Precompute n_tile * k_tiles * 256 once (constant across K-loop).
+    var n_tile_base = n_tile * k_tiles * 256
+    while ks < K:
+        # A: row-major padded [16,K] — vector load 8 FP8.
+        var a_row_base = row_or_col * K + ks + half * WMMA_FRAG
+        var a_fp8 = a_ptr.load[width=WMMA_FRAG](a_row_base)
+
+        var b_fp8: SIMD[FP8, WMMA_FRAG]
+        comptime if swizzled_b:
+            # Fragment-order: lane l reads contiguous 8 bytes → one coalesced
+            # 256B tile per wave (32 lanes × 8 B).
+            var b_base = n_tile_base + k_tile * 256 + l * 8
+            b_fp8 = w_ptr.load[width=WMMA_FRAG](b_base)
+        else:
+            # Row-major (embed / unswizzled).
+            var w_row_base = (NB + row_or_col) * K + ks + half * WMMA_FRAG
+            b_fp8 = w_ptr.load[width=WMMA_FRAG](w_row_base)
+
+        acc = wmma_fp8(
+            bitcast[DType.int32, 2](a_fp8),
+            bitcast[DType.int32, 2](b_fp8),
+            acc,
+        )
+        ks += WMMA_TILE
+        k_tile += 1
 
     if half == 0:
         var n = NB + row_or_col
@@ -406,7 +383,7 @@ def wmma_fp8_decode_kernel[
 
 
 def wmma_gemm_fp8_decode[
-    c_type: DType, add_residual: Bool = False
+    c_type: DType, add_residual: Bool = False, swizzled_b: Bool = True
 ](
     c: TileTensor[mut=True, dtype=c_type, ...],
     a_fp8: DeviceBuffer[FP8],
@@ -417,10 +394,10 @@ def wmma_gemm_fp8_decode[
     k: Int,
     ctx: DeviceContext,
 ) raises:
-    """Launch W8A8 decode WMMA: C[n] +=? act_scale * w_scale[n] * (A@W^T)[0,n]."""
+    """Launch W8A8 decode WMMA. Default: swizzled B (projection weights)."""
     debug_assert(n % WMMA_TILE == 0, "wmma_gemm_fp8_decode: n must be divisible by 16")
     debug_assert(k % WMMA_TILE == 0, "wmma_gemm_fp8_decode: k must be divisible by 16")
-    comptime kernel = wmma_fp8_decode_kernel[c_type, add_residual]
+    comptime kernel = wmma_fp8_decode_kernel[c_type, add_residual, swizzled_b]
     ctx.enqueue_function[kernel](
         a_fp8.unsafe_ptr().as_immutable().as_unsafe_any_origin(),
         w.ptr.as_immutable().as_unsafe_any_origin(),

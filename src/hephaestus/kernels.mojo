@@ -207,7 +207,9 @@ def quantize_act_fp8_pad(
 
 
 def gemv_fp8[
-    c_type: DType, add_residual: Bool = False
+    c_type: DType,
+    add_residual: Bool = False,
+    swizzled_b: Bool = True,
 ](
     c: TileTensor[mut=True, dtype=c_type, ...],
     a: TileTensor[mut=False, dtype=BF16, ...],
@@ -226,10 +228,11 @@ def gemv_fp8[
     No weight dequant. Workspace a_fp8_ws must hold ≥ 16*k FP8 elements.
     Pass do_quantize=False when a_fp8_ws/act_scale_ws already hold the
     quantized activation (shared q/k/v or gate/up).
+    swizzled_b=False for embed/lm_head (row-major, not fragment-swizzled).
     """
     if do_quantize:
         quantize_act_fp8_pad(a_fp8_ws, act_scale_ws, a, k, ctx)
-    wmma_gemm_fp8_decode[c_type, add_residual](
+    wmma_gemm_fp8_decode[c_type, add_residual, swizzled_b](
         c,
         a_fp8_ws,
         w,
@@ -242,7 +245,7 @@ def gemv_fp8[
 
 
 def linear_fp8[
-    c_type: DType
+    c_type: DType, swizzled_b: Bool = True
 ](
     c: TileTensor[mut=True, dtype=c_type, ...],
     a: TileTensor[mut=False, dtype=BF16, ...],
@@ -259,7 +262,7 @@ def linear_fp8[
 ) raises:
     """C = A @ W^T via W8A8 FP8 WMMA (decode M=1). Prefill loops per row."""
     if m == 1:
-        gemv_fp8[c_type, False](
+        gemv_fp8[c_type, False, swizzled_b](
             c,
             a,
             w,
@@ -280,12 +283,14 @@ def linear_fp8[
         var c_row = TileTensor(
             ptr=c.ptr + row * n, layout=row_major(Coord(Index(1, n)))
         )
-        gemv_fp8[c_type, False](
+        gemv_fp8[c_type, False, swizzled_b](
             c_row, a_row, w, scale, a_fp8_ws, act_scale_ws, n, k, ctx
         )
 
 
-def linear_add_residual_fp8(
+def linear_add_residual_fp8[
+    swizzled_b: Bool = True
+](
     residual: TileTensor[mut=True, dtype=BF16, ...],
     a: TileTensor[mut=False, dtype=BF16, ...],
     w: TileTensor[mut=False, dtype=FP8, ...],
@@ -301,7 +306,7 @@ def linear_add_residual_fp8(
 ) raises:
     """residual += A @ W^T (W8A8 FP8 WMMA)."""
     if m == 1:
-        gemv_fp8[BF16, True](
+        gemv_fp8[BF16, True, swizzled_b](
             residual,
             a,
             w,
@@ -321,7 +326,7 @@ def linear_add_residual_fp8(
         var r_row = TileTensor(
             ptr=residual.ptr + row * n, layout=row_major(Coord(Index(1, n)))
         )
-        gemv_fp8[BF16, True](
+        gemv_fp8[BF16, True, swizzled_b](
             r_row, a_row, w, scale, a_fp8_ws, act_scale_ws, n, k, ctx
         )
 

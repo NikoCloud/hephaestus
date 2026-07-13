@@ -522,7 +522,8 @@ def forward_fp8[
         ctx,
     )
     var logits = TileTensor(acts.logits, row_major(Coord(Index(seq, vocab))))
-    linear_fp8[F32](
+    # embed_tokens is NOT swizzled (needed for gather); lm_head uses row-major B.
+    linear_fp8[F32, False](
         logits,
         xn,
         weights.embed_tokens,
