@@ -1,6 +1,6 @@
 # CONCURRENCY SHAPE PROBE — Does our kernel/memory system hold throughput as concurrency rises?
 
-**Status:** RATIFIED 2026-07-20 — measure before building Phase 2. The probe sets the gate; the gate sets the build.
+**Status:** [SUPERSEDED 2026-07-20 — NULL RESULT] The probe as specified fired N independent forwards on one in-order HIP stream, which serializes by construction; it measured a queue, not a kernel/memory floor. Replaced by the fused M-row probe (bench/fused-mrow-decode-probe.md). The design lesson is recorded in bench/DIARY.md. This spec is kept for the record; do not re-run it.
 **Owner of spec:** Frank (GLM). **Implementer:** Grok (fresh session). **Target:** `bench/concurrency-shape-probe.md`.
 **Depends on:** Phase 1b closeout on `main` (FP8 WMMA decode + prefill, attention stopgap). Does NOT depend on any Phase 2 build.
 **Rule:** this probe evaluates our engine's kernel/memory floor with NO scheduler. Collapse here is decisive — no scheduler rescues it. Flat clears ONE of two failure modes, not both. A flat curve must not be written up as "Phase 2 de-risked."
