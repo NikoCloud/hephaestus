@@ -6,6 +6,24 @@ A lightweight, GUI-less LLM inference engine written in [Mojo](https://www.modul
 
 > **Status: pre-alpha, Phase 1a complete (G1a-1/2/3 PASS), Phase 1b not started.** BF16 Qwen3-4B forward path works on RDNA4 and clears the Phase 1a gates. There is still no FP8 path, no HTTP server, and no general model support — not a drop-in llama.cpp replacement. Star and watch if the mission matters; come back when 1b numbers appear.
 
+[![Stars](https://img.shields.io/github/stars/NikoCloud/hephaestus?style=for-the-badge&color=e94560)](https://github.com/NikoCloud/hephaestus/stargazers)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-green?style=for-the-badge)](LICENSE)
+[![Platform: Linux + ROCm](https://img.shields.io/badge/Platform-Linux_%2B_ROCm-blue?style=for-the-badge)](https://rocm.docs.amd.com)
+[![Phase: 1a PASS](https://img.shields.io/badge/Phase-1a_PASS-2ecc71?style=for-the-badge)](https://github.com/NikoCloud/hephaestus)
+
+---
+
+## Table of Contents
+
+- [Why this exists](#why-this-exists)
+- [What it is / what it isn't](#what-it-is--what-it-isnt)
+- [Roadmap &amp; honest numbers](#roadmap--honest-numbers)
+  - [Phase 1a numbers (honest, R9700, Qwen3-4B-Instruct-2507)](#phase-1a-numbers-honest-r9700-qwen3-4b-instruct-2507)
+- [Design positions](#design-positions)
+- [Hardware](#hardware)
+- [Acknowledgments](#acknowledgments)
+- [License](#license)
+
 ---
 
 ## Why this exists
