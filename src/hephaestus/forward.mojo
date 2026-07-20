@@ -26,6 +26,7 @@ from hephaestus.kernels import (
     apply_rope_qk_inplace,
     attention,
     embed_lookup_fp8,
+    kv_fp8_roundtrip_inplace,
     linear,
     linear_add_residual,
     linear_add_residual_fp8,
@@ -312,6 +313,9 @@ def forward_fp8[
     n_heads: Int,
     n_kv_heads: Int,
     theta: Float64,
+    # FP8-KV quality probe: quantize→dequantize K/V at cache-write (BF16
+    # storage). Default False — production path unchanged.
+    fp8_kv_cache: Bool = False,
 ](
     weights: Qwen3WeightsFP8[
         _, vocab, hidden, q_out, kv_out, head_dim, inter, n_layers
@@ -327,6 +331,11 @@ def forward_fp8[
     Embeddings dequant on gather (BF16 residual stream). All projections:
     per-token absmax quant of BF16 act → FP8, pad to 16×K, native
     llvm.amdgcn.wmma.f32.16x16x16.fp8.fp8, dual-scale epilogue. Norms BF16.
+
+    When `fp8_kv_cache=True` (probe only): after RoPE for K (V after v_proj
+    is written), each new cache row is E4M3 quant→dequant in place with
+    per-token absmax/448 scaling, separate for K and V. Storage stays BF16;
+    attention then reads values numerically identical to a real FP8 KV cache.
     """
     comptime group = n_heads // n_kv_heads
     var past = cache.length
@@ -434,6 +443,17 @@ def forward_fp8[
             past,
             ctx,
         )
+
+        # FP8-KV probe: quantize AFTER RoPE for K (distribution changed by
+        # rotation). V has no RoPE — roundtrip the just-written v_proj rows.
+        # Storage remains BF16; values match dequant-on-read from E4M3.
+        comptime if fp8_kv_cache:
+            kv_fp8_roundtrip_inplace(
+                k_new_ptr.as_unsafe_any_origin(), seq, kv_out, ctx
+            )
+            kv_fp8_roundtrip_inplace(
+                v_new_ptr.as_unsafe_any_origin(), seq, kv_out, ctx
+            )
 
         attention[head_dim, group](
             acts.attn_out.unsafe_ptr().as_unsafe_any_origin(),

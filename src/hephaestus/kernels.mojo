@@ -285,6 +285,88 @@ def quantize_act_rows_fp8(
     )
 
 
+# ===----------------------------------------------------------------------=== #
+# FP8 KV quality probe: quantize→dequantize at cache-write (keep BF16 storage)
+#
+# Numerically identical to a real FP8 E4M3 KV cache read path. Does NOT change
+# storage format — only the values written into the existing BF16 cache.
+# Scaling: per-token (row), per-layer (caller), separate K vs V, absmax/448.
+# Apply K AFTER RoPE; V after v_proj (V has no RoPE).
+# ===----------------------------------------------------------------------=== #
+
+def kv_fp8_roundtrip_kernel(
+    data_ptr: UnsafePointer[Scalar[BF16], MutAnyOrigin],
+    n_tokens: Int,
+    row_width: Int,
+):
+    """In-place BF16 → E4M3 → BF16 roundtrip per token row.
+
+    scale = max(|row|) / FP8_E4M3_MAX. One block per token; shared-mem absmax.
+    """
+    var tok = Int(block_idx.x)
+    if tok >= n_tokens:
+        return
+    var tid = Int(thread_idx.x)
+    var sh = stack_allocation[
+        QUANT_TPB, F32, address_space = AddressSpace.SHARED
+    ]()
+
+    var base = tok * row_width
+    var local = Float32(0)
+    var i = tid
+    while i < row_width:
+        var v = data_ptr[base + i].cast[F32]()
+        if v < Float32(0):
+            v = -v
+        if v > local:
+            local = v
+        i += QUANT_TPB
+    sh[tid] = local
+    barrier()
+
+    var stride = QUANT_TPB // 2
+    while stride > 0:
+        if tid < stride:
+            var o = sh[tid + stride]
+            if o > sh[tid]:
+                sh[tid] = o
+        barrier()
+        stride //= 2
+
+    var max_abs = sh[0]
+    var scale = max_abs / FP8_E4M3_MAX
+    if scale < Float32(1e-12):
+        scale = Float32(1.0)
+    barrier()
+
+    var inv = Float32(1.0) / scale
+    i = tid
+    while i < row_width:
+        # quantize to E4M3 then dequantize back to BF16 (same values a real
+        # FP8 cache would return after dequant-on-read).
+        var q = (data_ptr[base + i].cast[F32]() * inv).cast[FP8]()
+        data_ptr[base + i] = (q.cast[F32]() * scale).cast[BF16]()
+        i += QUANT_TPB
+
+
+def kv_fp8_roundtrip_inplace(
+    data_ptr: UnsafePointer[Scalar[BF16], MutAnyOrigin],
+    n_tokens: Int,
+    row_width: Int,
+    ctx: DeviceContext,
+) raises:
+    """Host launch: in-place E4M3 quant→dequant on [n_tokens, row_width] BF16."""
+    if n_tokens <= 0:
+        return
+    ctx.enqueue_function[kv_fp8_roundtrip_kernel](
+        data_ptr,
+        n_tokens,
+        row_width,
+        grid_dim=(n_tokens,),
+        block_dim=(QUANT_TPB,),
+    )
+
+
 def gemv_fp8[
     c_type: DType,
     add_residual: Bool = False,
