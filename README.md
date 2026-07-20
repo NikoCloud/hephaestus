@@ -4,7 +4,7 @@
 
 A lightweight, GUI-less LLM inference engine written in [Mojo](https://www.modular.com/mojo). Loads FP8 E4M3 **safetensors directly** — no GGUF, no conversion step, no translation layers — and feeds them straight to RDNA4's WMMA matrix units.
 
-> **Status: pre-alpha, Phase 1a complete (G1a-1/2/3 PASS), Phase 1b in progress.** BF16 Qwen3-4B forward path works on RDNA4 and clears the Phase 1a gates. **Native FP8 E4M3 WMMA is proven on gfx1201** (`experiments/exp3g_*`, via direct `llvm_intrinsic`) and a W8A8 FP8 decode path runs end-to-end at **97.4% argmax parity** vs the HF oracle -- but it is **not yet faster than llama.cpp Q8_0 decode** (0.36x; see `bench/` on branch `fp8-wmma-decode`). No HTTP server, no batching, no general model support -- not a drop-in llama.cpp replacement.
+> **Status: pre-alpha, Phase 1a complete (G1a-1/2/3 PASS), Phase 1b in progress.** BF16 Qwen3-4B forward path works on RDNA4 and clears the Phase 1a gates. **Native FP8 E4M3 WMMA is proven on gfx1201** (`experiments/exp3g_*`, via direct `llvm_intrinsic`) and a W8A8 FP8 decode path runs end-to-end at **97.4% argmax parity** vs the HF oracle -- but it is **not yet faster than llama.cpp Q8_0 decode** (0.36x; see `bench/1b-fp8-wmma-decode.md`). No HTTP server, no batching, no general model support -- not a drop-in llama.cpp replacement.
 
 [![Stars](https://img.shields.io/github/stars/NikoCloud/hephaestus?style=for-the-badge&color=e94560)](https://github.com/NikoCloud/hephaestus/stargazers)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-green?style=for-the-badge)](LICENSE)
