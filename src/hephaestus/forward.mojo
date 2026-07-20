@@ -25,13 +25,17 @@ from hephaestus.kernels import (
     F32,
     apply_rope_qk_inplace,
     attention,
+    embed_lookup_fp8,
     linear,
     linear_add_residual,
+    linear_add_residual_fp8,
+    linear_fp8,
     silu_mul,
     BF16,
     MAX_KEYS,
 )
 from hephaestus.model import Qwen3Weights
+from hephaestus.model_fp8 import Qwen3WeightsFP8
 
 comptime EPS = Float32(1e-6)
 
@@ -91,6 +95,11 @@ struct Activations[
     var up: DeviceBuffer[BF16]  # [seq, inter]
     var act: DeviceBuffer[BF16]  # [seq, inter] silu(gate)*up
     var logits: DeviceBuffer[F32]  # [seq, vocab] -- fp32, never bf16
+    # W8A8 decode workspace: padded act [16, K_max] + per-token act scale.
+    # K_max = inter (largest GEMV K: down_proj). q_out used as K for o_proj
+    # is smaller. See quantize_act_fp8_pad / wmma_gemm_fp8_decode.
+    var a_fp8_pad: DeviceBuffer[DType.float8_e4m3fn]
+    var act_scale: DeviceBuffer[F32]
     var max_seq: Int
 
     def __init__(out self, ctx: DeviceContext, max_seq: Int) raises:
@@ -105,6 +114,11 @@ struct Activations[
         self.up = ctx.enqueue_create_buffer[BF16](max_seq * Self.inter)
         self.act = ctx.enqueue_create_buffer[BF16](max_seq * Self.inter)
         self.logits = ctx.enqueue_create_buffer[F32](max_seq * Self.vocab)
+        # 16 rows × max(K) for WMMA pad. inter ≥ q_out ≥ hidden on Qwen3-4B.
+        self.a_fp8_pad = ctx.enqueue_create_buffer[DType.float8_e4m3fn](
+            16 * Self.inter
+        )
+        self.act_scale = ctx.enqueue_create_buffer[F32](1)
         self.max_seq = max_seq
 
 
@@ -281,5 +295,245 @@ def forward[
     )
     var logits = TileTensor(acts.logits, row_major(Coord(Index(seq, vocab))))
     linear(logits, xn, weights.embed_tokens, seq, vocab, hidden, ctx)
+
+    cache.length = past + seq
+
+
+def forward_fp8[
+    vocab: Int,
+    hidden: Int,
+    q_out: Int,
+    kv_out: Int,
+    head_dim: Int,
+    inter: Int,
+    n_layers: Int,
+    n_heads: Int,
+    n_kv_heads: Int,
+    theta: Float64,
+](
+    weights: Qwen3WeightsFP8[
+        _, vocab, hidden, q_out, kv_out, head_dim, inter, n_layers
+    ],
+    mut acts: Activations[hidden, q_out, kv_out, inter, vocab],
+    mut cache: KVCache[n_layers, kv_out],
+    token_ids: DeviceBuffer[DType.int32],
+    seq: Int,
+    ctx: DeviceContext,
+) raises:
+    """Forward with FP8 E4M3 weights + W8A8 WMMA decode (G1b-4).
+
+    Embeddings dequant on gather (BF16 residual stream). All projections:
+    per-token absmax quant of BF16 act → FP8, pad to 16×K, native
+    llvm.amdgcn.wmma.f32.16x16x16.fp8.fp8, dual-scale epilogue. Norms BF16.
+    """
+    comptime group = n_heads // n_kv_heads
+    var past = cache.length
+
+    var x = TileTensor(acts.x, row_major(Coord(Index(seq, hidden))))
+    embed_lookup_fp8(
+        x, weights.embed_tokens, weights.embed_scale, token_ids, seq, hidden, ctx
+    )
+
+    var xn = TileTensor(acts.xn, row_major(Coord(Index(seq, hidden))))
+    var q = TileTensor(acts.q, row_major(Coord(Index(seq, q_out))))
+    var attn_out = TileTensor(acts.attn_out, row_major(Coord(Index(seq, q_out))))
+    var gate = TileTensor(acts.gate, row_major(Coord(Index(seq, inter))))
+    var up = TileTensor(acts.up, row_major(Coord(Index(seq, inter))))
+    var act = TileTensor(acts.act, row_major(Coord(Index(seq, inter))))
+
+    for i in range(n_layers):
+        ref layer = weights.layers[i]
+
+        _rms_norm(
+            acts.xn.unsafe_ptr().as_unsafe_any_origin(),
+            acts.x.unsafe_ptr().as_unsafe_any_origin(),
+            layer.attn_norm,
+            seq,
+            hidden,
+            ctx,
+        )
+
+        var layer_off = i * MAX_KEYS * kv_out
+        var k_cache = cache.k.unsafe_ptr() + layer_off
+        var v_cache = cache.v.unsafe_ptr() + layer_off
+        var k_new_ptr = k_cache + past * kv_out
+        var v_new_ptr = v_cache + past * kv_out
+        var k_dst = TileTensor(
+            ptr=k_new_ptr, layout=row_major(Coord(Index(seq, kv_out)))
+        )
+        var v_dst = TileTensor(
+            ptr=v_new_ptr, layout=row_major(Coord(Index(seq, kv_out)))
+        )
+
+        # q/k/v share the same xn — quantize once, three WMMA launches.
+        linear_fp8(
+            q,
+            xn,
+            layer.q_proj,
+            layer.q_proj_scale,
+            acts.a_fp8_pad,
+            acts.act_scale,
+            seq,
+            q_out,
+            hidden,
+            ctx,
+            do_quantize=True,
+        )
+        linear_fp8(
+            k_dst,
+            xn,
+            layer.k_proj,
+            layer.k_proj_scale,
+            acts.a_fp8_pad,
+            acts.act_scale,
+            seq,
+            kv_out,
+            hidden,
+            ctx,
+            do_quantize=False,
+        )
+        linear_fp8(
+            v_dst,
+            xn,
+            layer.v_proj,
+            layer.v_proj_scale,
+            acts.a_fp8_pad,
+            acts.act_scale,
+            seq,
+            kv_out,
+            hidden,
+            ctx,
+            do_quantize=False,
+        )
+
+        _rms_norm(
+            acts.q.unsafe_ptr().as_unsafe_any_origin(),
+            acts.q.unsafe_ptr().as_unsafe_any_origin(),
+            layer.q_norm,
+            seq * n_heads,
+            head_dim,
+            ctx,
+        )
+        _rms_norm(
+            k_new_ptr.as_unsafe_any_origin(),
+            k_new_ptr.as_unsafe_any_origin(),
+            layer.k_norm,
+            seq * n_kv_heads,
+            head_dim,
+            ctx,
+        )
+
+        apply_rope_qk_inplace[head_dim, theta](
+            acts.q.unsafe_ptr().as_unsafe_any_origin(),
+            k_new_ptr.as_unsafe_any_origin(),
+            n_heads,
+            n_kv_heads,
+            seq,
+            past,
+            ctx,
+        )
+
+        attention[head_dim, group](
+            acts.attn_out.unsafe_ptr().as_unsafe_any_origin(),
+            acts.q.unsafe_ptr().as_unsafe_any_origin(),
+            k_cache.as_unsafe_any_origin(),
+            v_cache.as_unsafe_any_origin(),
+            n_heads,
+            n_kv_heads,
+            seq,
+            past,
+            ctx,
+        )
+
+        linear_add_residual_fp8(
+            x,
+            attn_out,
+            layer.o_proj,
+            layer.o_proj_scale,
+            acts.a_fp8_pad,
+            acts.act_scale,
+            seq,
+            hidden,
+            q_out,
+            ctx,
+        )
+
+        _rms_norm(
+            acts.xn.unsafe_ptr().as_unsafe_any_origin(),
+            acts.x.unsafe_ptr().as_unsafe_any_origin(),
+            layer.ffn_norm,
+            seq,
+            hidden,
+            ctx,
+        )
+        # gate/up share ffn-normed xn — quantize once.
+        linear_fp8(
+            gate,
+            xn,
+            layer.gate_proj,
+            layer.gate_proj_scale,
+            acts.a_fp8_pad,
+            acts.act_scale,
+            seq,
+            inter,
+            hidden,
+            ctx,
+            do_quantize=True,
+        )
+        linear_fp8(
+            up,
+            xn,
+            layer.up_proj,
+            layer.up_proj_scale,
+            acts.a_fp8_pad,
+            acts.act_scale,
+            seq,
+            inter,
+            hidden,
+            ctx,
+            do_quantize=False,
+        )
+        silu_mul(
+            acts.act.unsafe_ptr().as_unsafe_any_origin(),
+            acts.gate.unsafe_ptr().as_unsafe_any_origin(),
+            acts.up.unsafe_ptr().as_unsafe_any_origin(),
+            seq * inter,
+            ctx,
+        )
+        linear_add_residual_fp8(
+            x,
+            act,
+            layer.down_proj,
+            layer.down_proj_scale,
+            acts.a_fp8_pad,
+            acts.act_scale,
+            seq,
+            hidden,
+            inter,
+            ctx,
+        )
+
+    _rms_norm(
+        acts.xn.unsafe_ptr().as_unsafe_any_origin(),
+        acts.x.unsafe_ptr().as_unsafe_any_origin(),
+        weights.output_norm,
+        seq,
+        hidden,
+        ctx,
+    )
+    var logits = TileTensor(acts.logits, row_major(Coord(Index(seq, vocab))))
+    # embed_tokens is NOT swizzled (needed for gather); lm_head uses row-major B.
+    linear_fp8[F32, False](
+        logits,
+        xn,
+        weights.embed_tokens,
+        weights.embed_scale,
+        acts.a_fp8_pad,
+        acts.act_scale,
+        seq,
+        vocab,
+        hidden,
+        ctx,
+    )
 
     cache.length = past + seq

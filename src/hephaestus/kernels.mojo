@@ -13,20 +13,26 @@
 # hephaestus-wmma-nightly env.
 # ===----------------------------------------------------------------------=== #
 
-from std.gpu import barrier, block_dim, block_idx, thread_idx
+from std.gpu import WARP_SIZE, barrier, block_dim, block_idx, thread_idx
+from std.gpu.host import DeviceBuffer, DeviceContext
 from std.gpu.memory import AddressSpace
 from std.gpu.primitives.warp import shuffle_down
 from std.math import ceildiv, cos, exp, sin, sqrt
 from std.memory import stack_allocation
-
-from std.gpu.host import DeviceBuffer, DeviceContext
 from std.utils.index import Index, IndexList
+
 from layout import Coord, TileTensor
 from layout.tile_layout import row_major
 from linalg.gemv import gemv_gpu
 from linalg.matmul.gpu import matmul_kernel_naive
 
-from hephaestus.wmma_gfx12 import WMMA_TILE, wmma_gemm_bf16
+from hephaestus.wmma_gfx12 import (
+    FP8,
+    FP8_E4M3_MAX,
+    WMMA_TILE,
+    wmma_gemm_bf16,
+    wmma_gemm_fp8_decode,
+)
 
 comptime BF16 = DType.bfloat16
 comptime F32 = DType.float32
@@ -108,6 +114,264 @@ def linear(
         return
 
     _linear_naive(c, a, b, m, n, k, ctx)
+
+
+# ===----------------------------------------------------------------------=== #
+# FP8 W8A8 decode (G1b-4): quantize act → FP8 WMMA → dual-scale epilogue
+#
+# RDNA4 has no scalar FP8 dot. Compute is WMMA-only, both operands 8-bit.
+# Weights stay FP8 in the arena (no dequant). Activations: per-token absmax
+# quant to E4M3, pad M=1 → 16×K, WMMA f32.16x16x16.fp8.fp8 (exp3g).
+# Epilogue: C[n] = act_scale * weight_scale[n] * acc[0, n]  (+ residual).
+# ===----------------------------------------------------------------------=== #
+
+comptime QUANT_TPB = 256
+
+
+def quantize_act_absmax_kernel(
+    a_fp8_ptr: UnsafePointer[Scalar[FP8], MutAnyOrigin],
+    scale_ptr: UnsafePointer[Scalar[F32], MutAnyOrigin],
+    x_ptr: UnsafePointer[Scalar[BF16], ImmutAnyOrigin],
+    k: Int,
+):
+    """Per-token absmax quant of x[0..k) → a_fp8 row 0; zero-pad rows 1..15.
+
+    scale = max(|x|) / FP8_E4M3_MAX.  One block; shared-mem tree reduce.
+    """
+    var tid = Int(thread_idx.x)
+    var sh = stack_allocation[
+        QUANT_TPB, F32, address_space = AddressSpace.SHARED
+    ]()
+
+    # Local absmax.
+    var local = Float32(0)
+    var i = tid
+    while i < k:
+        var v = x_ptr[i].cast[F32]()
+        if v < Float32(0):
+            v = -v
+        if v > local:
+            local = v
+        i += QUANT_TPB
+    sh[tid] = local
+    barrier()
+
+    var stride = QUANT_TPB // 2
+    while stride > 0:
+        if tid < stride:
+            var o = sh[tid + stride]
+            if o > sh[tid]:
+                sh[tid] = o
+        barrier()
+        stride //= 2
+
+    var max_abs = sh[0]
+    var scale = max_abs / FP8_E4M3_MAX
+    # Avoid /0 and under-scale when activation is all zeros.
+    if scale < Float32(1e-12):
+        scale = Float32(1.0)
+    if tid == 0:
+        scale_ptr[0] = scale
+    barrier()
+
+    var inv = Float32(1.0) / scale
+    # Row 0: quantized activation.
+    i = tid
+    while i < k:
+        a_fp8_ptr[i] = (x_ptr[i].cast[F32]() * inv).cast[FP8]()
+        i += QUANT_TPB
+    # Rows 1..15: zeros (WMMA pad).
+    var pad_elems = 15 * k
+    i = tid
+    while i < pad_elems:
+        a_fp8_ptr[k + i] = Scalar[FP8](0)
+        i += QUANT_TPB
+
+
+def quantize_act_fp8_pad(
+    a_fp8: DeviceBuffer[FP8],
+    act_scale: DeviceBuffer[F32],
+    x: TileTensor[mut=False, dtype=BF16, ...],
+    k: Int,
+    ctx: DeviceContext,
+) raises:
+    """Quantize BF16 row x[0,:k] → a_fp8[16,k] pad + act_scale[0]."""
+    ctx.enqueue_function[quantize_act_absmax_kernel](
+        a_fp8.unsafe_ptr().unsafe_mut_cast[True]().as_unsafe_any_origin(),
+        act_scale.unsafe_ptr().unsafe_mut_cast[True]().as_unsafe_any_origin(),
+        x.ptr.as_immutable().as_unsafe_any_origin(),
+        k,
+        grid_dim=(1,),
+        block_dim=(QUANT_TPB,),
+    )
+
+
+def gemv_fp8[
+    c_type: DType,
+    add_residual: Bool = False,
+    swizzled_b: Bool = False,
+](
+    c: TileTensor[mut=True, dtype=c_type, ...],
+    a: TileTensor[mut=False, dtype=BF16, ...],
+    w: TileTensor[mut=False, dtype=FP8, ...],
+    scale: TileTensor[mut=False, dtype=F32, ...],
+    a_fp8_ws: DeviceBuffer[FP8],
+    act_scale_ws: DeviceBuffer[F32],
+    n: Int,
+    k: Int,
+    ctx: DeviceContext,
+    *,
+    do_quantize: Bool = True,
+) raises:
+    """W8A8 decode: quantize a → FP8 WMMA → C[n] = act_s * w_s[n] * (A@W^T)[0,n].
+
+    No weight dequant. Workspace a_fp8_ws must hold ≥ 16*k FP8 elements.
+    Pass do_quantize=False when a_fp8_ws/act_scale_ws already hold the
+    quantized activation (shared q/k/v or gate/up).
+    swizzled_b=False for embed/lm_head (row-major, not fragment-swizzled).
+    """
+    if do_quantize:
+        quantize_act_fp8_pad(a_fp8_ws, act_scale_ws, a, k, ctx)
+    wmma_gemm_fp8_decode[c_type, add_residual, swizzled_b](
+        c,
+        a_fp8_ws,
+        w,
+        scale,
+        act_scale_ws,
+        n,
+        k,
+        ctx,
+    )
+
+
+def linear_fp8[
+    c_type: DType, swizzled_b: Bool = False
+](
+    c: TileTensor[mut=True, dtype=c_type, ...],
+    a: TileTensor[mut=False, dtype=BF16, ...],
+    w: TileTensor[mut=False, dtype=FP8, ...],
+    scale: TileTensor[mut=False, dtype=F32, ...],
+    a_fp8_ws: DeviceBuffer[FP8],
+    act_scale_ws: DeviceBuffer[F32],
+    m: Int,
+    n: Int,
+    k: Int,
+    ctx: DeviceContext,
+    *,
+    do_quantize: Bool = True,
+) raises:
+    """C = A @ W^T via W8A8 FP8 WMMA (decode M=1). Prefill loops per row."""
+    if m == 1:
+        gemv_fp8[c_type, False, swizzled_b](
+            c,
+            a,
+            w,
+            scale,
+            a_fp8_ws,
+            act_scale_ws,
+            n,
+            k,
+            ctx,
+            do_quantize=do_quantize,
+        )
+        return
+    # Row-at-a-time for short prefill correctness (not the prefill perf path).
+    for row in range(m):
+        var a_row = TileTensor(
+            ptr=a.ptr + row * k, layout=row_major(Coord(Index(1, k)))
+        )
+        var c_row = TileTensor(
+            ptr=c.ptr + row * n, layout=row_major(Coord(Index(1, n)))
+        )
+        gemv_fp8[c_type, False, swizzled_b](
+            c_row, a_row, w, scale, a_fp8_ws, act_scale_ws, n, k, ctx
+        )
+
+
+def linear_add_residual_fp8[
+    swizzled_b: Bool = False
+](
+    residual: TileTensor[mut=True, dtype=BF16, ...],
+    a: TileTensor[mut=False, dtype=BF16, ...],
+    w: TileTensor[mut=False, dtype=FP8, ...],
+    scale: TileTensor[mut=False, dtype=F32, ...],
+    a_fp8_ws: DeviceBuffer[FP8],
+    act_scale_ws: DeviceBuffer[F32],
+    m: Int,
+    n: Int,
+    k: Int,
+    ctx: DeviceContext,
+    *,
+    do_quantize: Bool = True,
+) raises:
+    """residual += A @ W^T (W8A8 FP8 WMMA)."""
+    if m == 1:
+        gemv_fp8[BF16, True, swizzled_b](
+            residual,
+            a,
+            w,
+            scale,
+            a_fp8_ws,
+            act_scale_ws,
+            n,
+            k,
+            ctx,
+            do_quantize=do_quantize,
+        )
+        return
+    for row in range(m):
+        var a_row = TileTensor(
+            ptr=a.ptr + row * k, layout=row_major(Coord(Index(1, k)))
+        )
+        var r_row = TileTensor(
+            ptr=residual.ptr + row * n, layout=row_major(Coord(Index(1, n)))
+        )
+        gemv_fp8[BF16, True, swizzled_b](
+            r_row, a_row, w, scale, a_fp8_ws, act_scale_ws, n, k, ctx
+        )
+
+
+def embed_fp8_kernel(
+    out_ptr: UnsafePointer[Scalar[BF16], MutAnyOrigin],
+    emb_ptr: UnsafePointer[Scalar[FP8], ImmutAnyOrigin],
+    scale_ptr: UnsafePointer[Scalar[F32], ImmutAnyOrigin],
+    ids_ptr: UnsafePointer[Scalar[DType.int32], ImmutAnyOrigin],
+    seq: Int,
+    hidden: Int,
+):
+    """out[t,d] = scale[id[t]] * fp8_to_f32(embed[id[t], d])."""
+    var tid = Int(block_idx.x * block_dim.x + thread_idx.x)
+    var total = seq * hidden
+    if tid >= total:
+        return
+    var t = tid // hidden
+    var d = tid % hidden
+    var tok = Int(ids_ptr[t])
+    var s = scale_ptr[tok]
+    var v = emb_ptr[tok * hidden + d].cast[F32]()
+    out_ptr[t * hidden + d] = (s * v).cast[BF16]()
+
+
+def embed_lookup_fp8(
+    dst: TileTensor[mut=True, dtype=BF16, ...],
+    emb: TileTensor[mut=False, dtype=FP8, ...],
+    scale: TileTensor[mut=False, dtype=F32, ...],
+    ids: DeviceBuffer[DType.int32],
+    seq: Int,
+    hidden: Int,
+    ctx: DeviceContext,
+) raises:
+    comptime TPB = 256
+    ctx.enqueue_function[embed_fp8_kernel](
+        dst.ptr.as_unsafe_any_origin(),
+        emb.ptr.as_unsafe_any_origin(),
+        scale.ptr.as_unsafe_any_origin(),
+        ids.unsafe_ptr().as_immutable().as_unsafe_any_origin(),
+        seq,
+        hidden,
+        grid_dim=(ceildiv(seq * hidden, TPB),),
+        block_dim=(TPB,),
+    )
 
 
 def linear_add_residual(

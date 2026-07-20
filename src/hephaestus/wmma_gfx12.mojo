@@ -18,7 +18,7 @@
 # ===----------------------------------------------------------------------=== #
 
 from std.gpu import barrier, block_idx, thread_idx
-from std.gpu.host import DeviceContext
+from std.gpu.host import DeviceBuffer, DeviceContext
 from std.gpu.memory import AddressSpace
 from std.math import ceildiv
 from std.memory import bitcast, stack_allocation
@@ -269,5 +269,143 @@ def wmma_gemm_bf16_v1[
         n,
         k,
         grid_dim=(n_tiles, m_tiles),
+        block_dim=(WMMA_LANES,),
+    )
+
+
+# ===----------------------------------------------------------------------=== #
+
+# ===----------------------------------------------------------------------=== #
+# FP8 E4M3 × FP8 E4M3 → F32 WMMA (W8A8 decode path, G1b-4)
+#
+# Intrinsic (exp3g PASS on gfx1201):
+#   llvm.amdgcn.wmma.f32.16x16x16.fp8.fp8
+#   A/B: SIMD[int32, 2]  = 8 packed FP8 bytes (v2i32)
+#   C/D: SIMD[float32, 8]
+#
+# Lane mappings (G1b-0 geometry):
+#   A-load (row-major pad): a[j] = A[(l%16)*K + ks + (l/16)*8 + j]
+#   B-load (SWIZZLED weights — default):
+#     tile_base = n_tile*(K/16)*256 + k_tile*256
+#     b[j] = W_swz[tile_base + l*8 + j]   # coalesced: consecutive lanes, +8B
+#   B-load (row-major, embed/lm_head only):
+#     b[j] = W[(NB + l%16)*K + ks + (l/16)*8 + j]
+#   D-row0: half==0 → C[NB + l%16] = scale_act * w_scale[n] * acc[0]
+#
+# No LDS: M=1 has no reuse; barriers regressed. Swizzle coalesces without LDS.
+# ===----------------------------------------------------------------------=== #
+
+comptime FP8 = DType.float8_e4m3fn
+# FP8 E4M3 finite max (|max| ≈ 448). Used by activation absmax quant.
+comptime FP8_E4M3_MAX = Float32(448.0)
+
+
+@always_inline
+def wmma_fp8(
+    a_i32: SIMD[DType.int32, 2],
+    b_i32: SIMD[DType.int32, 2],
+    c: SIMD[DType.float32, WMMA_FRAG],
+) -> SIMD[DType.float32, WMMA_FRAG]:
+    """Direct llvm.amdgcn.wmma.f32.16x16x16.fp8.fp8 (exp3g arity: 3 operands)."""
+    return llvm_intrinsic[
+        "llvm.amdgcn.wmma.f32.16x16x16.fp8.fp8",
+        SIMD[DType.float32, WMMA_FRAG],
+        has_side_effect=False,
+    ](a_i32, b_i32, c)
+
+
+def wmma_fp8_decode_kernel[
+    c_type: DType, add_residual: Bool, swizzled_b: Bool
+](
+    a_ptr: UnsafePointer[Scalar[FP8], ImmutAnyOrigin],
+    w_ptr: UnsafePointer[Scalar[FP8], ImmutAnyOrigin],
+    w_scale_ptr: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
+    act_scale_ptr: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
+    c_ptr: UnsafePointer[Scalar[c_type], MutAnyOrigin],
+    N: Int,
+    K: Int,
+):
+    """W8A8 decode: C[n] = act_scale * w_scale[n] * (A@W^T)[0,n].
+
+    swizzled_b=True: projection weights in fragment order (coalesced B-load).
+    swizzled_b=False: row-major B (embed/lm_head only).
+    """
+    var l = Int(thread_idx.x)
+    if l >= WMMA_LANES:
+        return
+
+    var n_tile = Int(block_idx.x)
+    var NB = n_tile * WMMA_TILE
+    if NB >= N:
+        return
+
+    var row_or_col = l % WMMA_TILE
+    var half = l // WMMA_TILE
+    var k_tiles = K // WMMA_TILE
+    var acc = SIMD[DType.float32, WMMA_FRAG](0.0)
+
+    var ks = 0
+    var k_tile = 0
+    # Precompute n_tile * k_tiles * 256 once (constant across K-loop).
+    var n_tile_base = n_tile * k_tiles * 256
+    while ks < K:
+        # A: row-major padded [16,K] — vector load 8 FP8.
+        var a_row_base = row_or_col * K + ks + half * WMMA_FRAG
+        var a_fp8 = a_ptr.load[width=WMMA_FRAG](a_row_base)
+
+        var b_fp8: SIMD[FP8, WMMA_FRAG]
+        comptime if swizzled_b:
+            # Fragment-order: lane l reads contiguous 8 bytes → one coalesced
+            # 256B tile per wave (32 lanes × 8 B).
+            var b_base = n_tile_base + k_tile * 256 + l * 8
+            b_fp8 = w_ptr.load[width=WMMA_FRAG](b_base)
+        else:
+            # Row-major (embed / unswizzled).
+            var w_row_base = (NB + row_or_col) * K + ks + half * WMMA_FRAG
+            b_fp8 = w_ptr.load[width=WMMA_FRAG](w_row_base)
+
+        acc = wmma_fp8(
+            bitcast[DType.int32, 2](a_fp8),
+            bitcast[DType.int32, 2](b_fp8),
+            acc,
+        )
+        ks += WMMA_TILE
+        k_tile += 1
+
+    if half == 0:
+        var n = NB + row_or_col
+        if n < N:
+            var sc = act_scale_ptr[0] * w_scale_ptr[n]
+            var v = acc[0] * sc
+            comptime if add_residual:
+                v = v + c_ptr[n].cast[DType.float32]()
+            c_ptr[n] = v.cast[c_type]()
+
+
+def wmma_gemm_fp8_decode[
+    c_type: DType, add_residual: Bool = False, swizzled_b: Bool = True
+](
+    c: TileTensor[mut=True, dtype=c_type, ...],
+    a_fp8: DeviceBuffer[FP8],
+    w: TileTensor[mut=False, dtype=FP8, ...],
+    w_scale: TileTensor[mut=False, dtype = DType.float32, ...],
+    act_scale: DeviceBuffer[DType.float32],
+    n: Int,
+    k: Int,
+    ctx: DeviceContext,
+) raises:
+    """Launch W8A8 decode WMMA. Default: swizzled B (projection weights)."""
+    debug_assert(n % WMMA_TILE == 0, "wmma_gemm_fp8_decode: n must be divisible by 16")
+    debug_assert(k % WMMA_TILE == 0, "wmma_gemm_fp8_decode: k must be divisible by 16")
+    comptime kernel = wmma_fp8_decode_kernel[c_type, add_residual, swizzled_b]
+    ctx.enqueue_function[kernel](
+        a_fp8.unsafe_ptr().as_immutable().as_unsafe_any_origin(),
+        w.ptr.as_immutable().as_unsafe_any_origin(),
+        w_scale.ptr.as_immutable().as_unsafe_any_origin(),
+        act_scale.unsafe_ptr().as_immutable().as_unsafe_any_origin(),
+        c.ptr.as_unsafe_any_origin(),
+        n,
+        k,
+        grid_dim=(n // WMMA_TILE,),
         block_dim=(WMMA_LANES,),
     )
