@@ -114,11 +114,13 @@ struct Activations[
         self.up = ctx.enqueue_create_buffer[BF16](max_seq * Self.inter)
         self.act = ctx.enqueue_create_buffer[BF16](max_seq * Self.inter)
         self.logits = ctx.enqueue_create_buffer[F32](max_seq * Self.vocab)
-        # 16 rows × max(K) for WMMA pad. inter ≥ q_out ≥ hidden on Qwen3-4B.
+        # FP8 act workspace: prefill needs [max_seq, K_max] with K_max=inter;
+        # decode pad-to-16 also fits (16*inter ≤ max_seq*inter when max_seq≥16).
         self.a_fp8_pad = ctx.enqueue_create_buffer[DType.float8_e4m3fn](
-            16 * Self.inter
+            max_seq * Self.inter
         )
-        self.act_scale = ctx.enqueue_create_buffer[F32](1)
+        # Per-row act scales for prefill; decode uses act_scale[0].
+        self.act_scale = ctx.enqueue_create_buffer[F32](max_seq)
         self.max_seq = max_seq
 
 

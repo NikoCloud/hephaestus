@@ -27,12 +27,14 @@ from linalg.gemv import gemv_gpu
 from linalg.matmul.gpu import matmul_kernel_naive
 
 from hephaestus.wmma_gfx12 import (
+    BN,
     FP8,
     FP8_E4M3_MAX,
     WMMA_TILE,
     wmma_gemm_bf16,
     wmma_gemm_bf16_residual,
     wmma_gemm_fp8_decode,
+    wmma_gemm_fp8_prefill,
 )
 
 comptime BF16 = DType.bfloat16
@@ -207,6 +209,82 @@ def quantize_act_fp8_pad(
     )
 
 
+def quantize_act_rows_kernel(
+    a_fp8_ptr: UnsafePointer[Scalar[FP8], MutAnyOrigin],
+    scale_ptr: UnsafePointer[Scalar[F32], MutAnyOrigin],
+    x_ptr: UnsafePointer[Scalar[BF16], ImmutAnyOrigin],
+    M: Int,
+    K: Int,
+):
+    """Per-row absmax quant: BF16 A[M,K] → FP8 A_fp8[M,K] + act_scale[M].
+
+    One block per row; shared-mem tree reduce over K (no pad-to-16).
+    """
+    var row = Int(block_idx.x)
+    if row >= M:
+        return
+    var tid = Int(thread_idx.x)
+    var sh = stack_allocation[
+        QUANT_TPB, F32, address_space = AddressSpace.SHARED
+    ]()
+
+    var local = Float32(0)
+    var i = tid
+    var base = row * K
+    while i < K:
+        var v = x_ptr[base + i].cast[F32]()
+        if v < Float32(0):
+            v = -v
+        if v > local:
+            local = v
+        i += QUANT_TPB
+    sh[tid] = local
+    barrier()
+
+    var stride = QUANT_TPB // 2
+    while stride > 0:
+        if tid < stride:
+            var o = sh[tid + stride]
+            if o > sh[tid]:
+                sh[tid] = o
+        barrier()
+        stride //= 2
+
+    var max_abs = sh[0]
+    var scale = max_abs / FP8_E4M3_MAX
+    if scale < Float32(1e-12):
+        scale = Float32(1.0)
+    if tid == 0:
+        scale_ptr[row] = scale
+    barrier()
+
+    var inv = Float32(1.0) / scale
+    i = tid
+    while i < K:
+        a_fp8_ptr[base + i] = (x_ptr[base + i].cast[F32]() * inv).cast[FP8]()
+        i += QUANT_TPB
+
+
+def quantize_act_rows_fp8(
+    a_fp8: DeviceBuffer[FP8],
+    act_scale: DeviceBuffer[F32],
+    x: TileTensor[mut=False, dtype=BF16, ...],
+    m: Int,
+    k: Int,
+    ctx: DeviceContext,
+) raises:
+    """Quantize BF16 A[m,k] → FP8 + per-row scales (prefill, no pad)."""
+    ctx.enqueue_function[quantize_act_rows_kernel](
+        a_fp8.unsafe_ptr().unsafe_mut_cast[True]().as_unsafe_any_origin(),
+        act_scale.unsafe_ptr().unsafe_mut_cast[True]().as_unsafe_any_origin(),
+        x.ptr.as_immutable().as_unsafe_any_origin(),
+        m,
+        k,
+        grid_dim=(m,),
+        block_dim=(QUANT_TPB,),
+    )
+
+
 def gemv_fp8[
     c_type: DType,
     add_residual: Bool = False,
@@ -261,7 +339,10 @@ def linear_fp8[
     *,
     do_quantize: Bool = True,
 ) raises:
-    """C = A @ W^T via W8A8 FP8 WMMA (decode M=1). Prefill loops per row."""
+    """C = A @ W^T via W8A8 FP8 WMMA.
+
+    M=1: decode gemv. M>1: v3a prefill when n%64 and k%16; else row-loop.
+    """
     if m == 1:
         gemv_fp8[c_type, False, swizzled_b](
             c,
@@ -276,7 +357,15 @@ def linear_fp8[
             do_quantize=do_quantize,
         )
         return
-    # Row-at-a-time for short prefill correctness (not the prefill perf path).
+
+    if n % BN == 0 and k % WMMA_TILE == 0:
+        if do_quantize:
+            quantize_act_rows_fp8(a_fp8_ws, act_scale_ws, a, m, k, ctx)
+        wmma_gemm_fp8_prefill[c_type, False](
+            c, a_fp8_ws, w, scale, act_scale_ws, m, n, k, ctx
+        )
+        return
+
     for row in range(m):
         var a_row = TileTensor(
             ptr=a.ptr + row * k, layout=row_major(Coord(Index(1, k)))
@@ -320,6 +409,15 @@ def linear_add_residual_fp8[
             do_quantize=do_quantize,
         )
         return
+
+    if n % BN == 0 and k % WMMA_TILE == 0:
+        if do_quantize:
+            quantize_act_rows_fp8(a_fp8_ws, act_scale_ws, a, m, k, ctx)
+        wmma_gemm_fp8_prefill[BF16, True](
+            residual, a_fp8_ws, w, scale, act_scale_ws, m, n, k, ctx
+        )
+        return
+
     for row in range(m):
         var a_row = TileTensor(
             ptr=a.ptr + row * k, layout=row_major(Coord(Index(1, k)))
@@ -743,6 +841,158 @@ def attention_kernel[
             od += WARP
 
 
+# Phase bitmasks for measurement launches (host times each enqueue).
+comptime ATTN_PHASE_QK = 1
+comptime ATTN_PHASE_SOFTMAX = 2
+comptime ATTN_PHASE_PV = 4
+comptime ATTN_PHASE_ALL = 7
+
+
+def attention_kernel_parallel[
+    head_dim: Int, group: Int, NUM_WARPS: Int = ATTN_NUM_WARPS
+](
+    out_ptr: UnsafePointer[Scalar[BF16], MutAnyOrigin],
+    q_ptr: UnsafePointer[Scalar[BF16], ImmutAnyOrigin],
+    k_ptr: UnsafePointer[Scalar[BF16], ImmutAnyOrigin],
+    v_ptr: UnsafePointer[Scalar[BF16], ImmutAnyOrigin],
+    n_heads: Int,
+    n_kv_heads: Int,
+    seq: Int,
+    past: Int,
+    scale: Float32,
+    phases: Int,
+):
+    """Parallel softmax + PV stopgap (ATTN-STOPGAP). QK identical to serial.
+
+    Softmax: block max/sum over scores (reduction-order differs on sum only).
+    PV: NT-way column-parallel, serial key order → bit-identical to serial PV
+    given the same normalized scores (incl. BF16 prob round-trip).
+    """
+    comptime NT = WARP * NUM_WARPS
+    var head = Int(block_idx.x)
+    var tok = Int(block_idx.y)
+    if head >= n_heads or tok >= seq:
+        return
+    var kv_head = head // group
+    var tid = Int(thread_idx.x)
+    var lane = tid % WARP
+    var warp_id = tid // WARP
+
+    var scores = stack_allocation[
+        MAX_KEYS, F32, address_space = AddressSpace.SHARED
+    ]()
+    var q_sh = stack_allocation[
+        head_dim, F32, address_space = AddressSpace.SHARED
+    ]()
+    var red = stack_allocation[
+        NUM_WARPS, F32, address_space = AddressSpace.SHARED
+    ]()
+
+    # --- Phase 0: load Q (UNCHANGED from serial — scale applied after QK) ---
+    var q_base = (tok * n_heads + head) * head_dim
+    var d = tid
+    while d < head_dim:
+        q_sh[d] = q_ptr[q_base + d].cast[F32]()
+        d += NT
+    barrier()
+
+    var n_keys = past + tok + 1
+
+    # --- Phase 1: QK (UNCHANGED — same multi-warp warp-reduce as serial) ---
+    if (phases & ATTN_PHASE_QK) != 0:
+        var j = warp_id
+        while j < n_keys:
+            var k_base = (j * n_kv_heads + kv_head) * head_dim
+            var partial = Float32(0)
+            var dd = lane
+            while dd < head_dim:
+                partial += q_sh[dd] * k_ptr[k_base + dd].cast[F32]()
+                dd += WARP
+            var off = WARP // 2
+            while off > 0:
+                partial += shuffle_down(partial, UInt32(off))
+                off //= 2
+            if lane == 0:
+                scores[j] = partial * scale
+            j += NUM_WARPS
+        barrier()
+
+    # --- Phase 2: parallel softmax (block max / exp+sum / normalize) ------
+    if (phases & ATTN_PHASE_SOFTMAX) != 0:
+        # 2a. block max
+        var lmax = Float32(-3.4e38)
+        var jm = tid
+        while jm < n_keys:
+            lmax = max(lmax, scores[jm])
+            jm += NT
+        var offm = WARP // 2
+        while offm > 0:
+            lmax = max(lmax, shuffle_down(lmax, UInt32(offm)))
+            offm //= 2
+        if lane == 0:
+            red[warp_id] = lmax
+        barrier()
+        if warp_id == 0:
+            var wmax = Float32(-3.4e38)
+            if lane < NUM_WARPS:
+                wmax = red[lane]
+            var om = 2
+            while om > 0:
+                wmax = max(wmax, shuffle_down(wmax, UInt32(om)))
+                om //= 2
+            if lane == 0:
+                red[0] = wmax
+        barrier()
+        var m = red[0]
+
+        # 2b. exp + block sum (overwrite scores with unnormalized exp)
+        var lsum = Float32(0)
+        var je = tid
+        while je < n_keys:
+            var e = exp(scores[je] - m)
+            scores[je] = e
+            lsum += e
+            je += NT
+        var offs = WARP // 2
+        while offs > 0:
+            lsum = lsum + shuffle_down(lsum, UInt32(offs))
+            offs //= 2
+        if lane == 0:
+            red[warp_id] = lsum
+        barrier()
+        if warp_id == 0:
+            var wsum = Float32(0)
+            if lane < NUM_WARPS:
+                wsum = red[lane]
+            var os = 2
+            while os > 0:
+                wsum = wsum + shuffle_down(wsum, UInt32(os))
+                os //= 2
+            if lane == 0:
+                red[0] = wsum
+        barrier()
+        var inv_s = Float32(1.0) / red[0]
+
+        # 2c. normalize + BF16 round-trip (match serial for PV bit-identity)
+        var jn = tid
+        while jn < n_keys:
+            scores[jn] = (scores[jn] * inv_s).cast[BF16]().cast[F32]()
+            jn += NT
+        barrier()
+
+    # --- Phase 3: parallel PV (column-parallel, serial key order) ---------
+    if (phases & ATTN_PHASE_PV) != 0:
+        var o_base = (tok * n_heads + head) * head_dim
+        var od = tid
+        while od < head_dim:
+            var acc = Float32(0)
+            for jj in range(n_keys):
+                var v_base = (jj * n_kv_heads + kv_head) * head_dim
+                acc += scores[jj] * v_ptr[v_base + od].cast[F32]()
+            out_ptr[o_base + od] = acc.cast[BF16]()
+            od += NT
+
+
 def attention[
     head_dim: Int, group: Int
 ](
@@ -755,23 +1005,47 @@ def attention[
     seq: Int,
     past: Int,
     ctx: DeviceContext,
+    *,
+    parallel: Bool = True,
+    phases: Int = ATTN_PHASE_ALL,
 ) raises:
+    """Attention dispatch. Default: parallel softmax+PV stopgap.
+
+    parallel=False uses the original single-lane softmax / single-warp PV
+    (validation reference). phases masks QK/SOFTMAX/PV for sub-split timing.
+    """
     if past + seq > MAX_KEYS:
         raise Error("sequence exceeds MAX_KEYS")
     var scale = Float32(1.0) / sqrt(Float32(head_dim))
-    ctx.enqueue_function[attention_kernel[head_dim, group]](
-        out_ptr,
-        q_ptr,
-        k_ptr,
-        v_ptr,
-        n_heads,
-        n_kv_heads,
-        seq,
-        past,
-        scale,
-        grid_dim=(n_heads, seq),
-        block_dim=(WARP * ATTN_NUM_WARPS,),
-    )
+    if parallel:
+        ctx.enqueue_function[attention_kernel_parallel[head_dim, group]](
+            out_ptr,
+            q_ptr,
+            k_ptr,
+            v_ptr,
+            n_heads,
+            n_kv_heads,
+            seq,
+            past,
+            scale,
+            phases,
+            grid_dim=(n_heads, seq),
+            block_dim=(WARP * ATTN_NUM_WARPS,),
+        )
+    else:
+        ctx.enqueue_function[attention_kernel[head_dim, group]](
+            out_ptr,
+            q_ptr,
+            k_ptr,
+            v_ptr,
+            n_heads,
+            n_kv_heads,
+            seq,
+            past,
+            scale,
+            grid_dim=(n_heads, seq),
+            block_dim=(WARP * ATTN_NUM_WARPS,),
+        )
 
 
 # ===----------------------------------------------------------------------=== #

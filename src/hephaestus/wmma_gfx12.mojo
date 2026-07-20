@@ -742,3 +742,147 @@ def wmma_gemm_fp8_decode[
         grid_dim=(n // WMMA_TILE,),
         block_dim=(WMMA_LANES,),
     )
+
+
+# ===----------------------------------------------------------------------=== #
+# FP8 v3a prefill GEMM (W8A8, M>1) — dtype sub into proven BF16 v3a structure
+#
+# A_fp8[M,K] @ W_fp8[N,K]^T → C[M,N] with C[m,n] = act_scale[m]*w_scale[n]*acc
+# LDS KEPT (M>1 reuses staged tiles). Edge-mask M (seq may not be %64).
+# Weights row-major (DO_FP8_WMMA_SWIZZLE=False on main).
+# ===----------------------------------------------------------------------=== #
+
+
+def wmma_gemm_kernel_v3a_fp8[
+    c_type: DType,
+    fuse_residual: Bool,
+](
+    a_ptr: UnsafePointer[Scalar[FP8], ImmutAnyOrigin],
+    w_ptr: UnsafePointer[Scalar[FP8], ImmutAnyOrigin],
+    w_scale_ptr: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
+    act_scale_ptr: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
+    c_ptr: UnsafePointer[Scalar[c_type], MutAnyOrigin],
+    M: Int,
+    N: Int,
+    K: Int,
+):
+    """v3a FP8: 64×64 tile / WG, LDS BK=16, dual-scale epilogue (+ optional residual).
+
+    Edge-masks M (A load zero-fill + C store skip). N,K must be tile-aligned
+    (model dims always are for BN/BK).
+    """
+    var tid = Int(thread_idx.x)
+    if tid >= V3A_THREADS:
+        return
+
+    var w = tid // WMMA_LANES
+    var l = tid % WMMA_LANES
+
+    var n_tile = Int(block_idx.x)
+    var m_tile = Int(block_idx.y)
+    var MB = m_tile * BM
+    var NB = n_tile * BN
+
+    if MB >= M or NB >= N:
+        return
+
+    var A_lds = stack_allocation[
+        BM * LDS_STRIDE, FP8, address_space = AddressSpace.SHARED
+    ]()
+    var B_lds = stack_allocation[
+        BN * LDS_STRIDE, FP8, address_space = AddressSpace.SHARED
+    ]()
+
+    var acc = InlineArray[SIMD[DType.float32, WMMA_FRAG], V3A_SC](
+        uninitialized=True
+    )
+    comptime for sc in range(V3A_SC):
+        acc[sc] = SIMD[DType.float32, WMMA_FRAG](0.0)
+
+    var ks = 0
+    while ks < K:
+        # Cooperative load A[64,16] with M edge mask.
+        comptime for i in range(8):
+            var row = i * 8 + tid // 16
+            var col = tid % 16
+            var g_row = MB + row
+            if g_row < M:
+                A_lds[row * LDS_STRIDE + col] = a_ptr[g_row * K + ks + col]
+            else:
+                A_lds[row * LDS_STRIDE + col] = Scalar[FP8](0)
+
+        # B from W[N,K] n-major (N is tile-aligned — no edge mask needed).
+        comptime for i in range(8):
+            var row = i * 8 + tid // 16
+            var col = tid % 16
+            B_lds[row * LDS_STRIDE + col] = w_ptr[(NB + row) * K + ks + col]
+
+        barrier()
+
+        var a_fp8 = SIMD[FP8, WMMA_FRAG](0)
+        var a_base = (w * WMMA_TILE + l % WMMA_TILE) * LDS_STRIDE + (
+            l // WMMA_TILE
+        ) * WMMA_FRAG
+        comptime for j in range(WMMA_FRAG):
+            a_fp8[j] = A_lds[a_base + j]
+        var a_i32 = bitcast[DType.int32, 2](a_fp8)
+
+        comptime for sc in range(V3A_SC):
+            var b_fp8 = SIMD[FP8, WMMA_FRAG](0)
+            var b_base = (sc * WMMA_TILE + l % WMMA_TILE) * LDS_STRIDE + (
+                l // WMMA_TILE
+            ) * WMMA_FRAG
+            comptime for j in range(WMMA_FRAG):
+                b_fp8[j] = B_lds[b_base + j]
+            var b_i32 = bitcast[DType.int32, 2](b_fp8)
+            acc[sc] = wmma_fp8(a_i32, b_i32, acc[sc])
+
+        barrier()
+        ks += BK
+
+    # Store: C[m,n] = act_scale[m] * w_scale[n] * acc  (+ residual)
+    comptime for sc in range(V3A_SC):
+        comptime for j in range(WMMA_FRAG):
+            var m = MB + w * WMMA_TILE + (l // WMMA_TILE) * WMMA_FRAG + j
+            var n = NB + sc * WMMA_TILE + l % WMMA_TILE
+            if m < M and n < N:
+                var val = acc[sc][j] * act_scale_ptr[m] * w_scale_ptr[n]
+                comptime if fuse_residual:
+                    val = val + c_ptr[m * N + n].cast[DType.float32]()
+                c_ptr[m * N + n] = val.cast[c_type]()
+
+
+def wmma_gemm_fp8_prefill[
+    c_type: DType, fuse_residual: Bool = False
+](
+    c: TileTensor[mut=True, dtype=c_type, ...],
+    a_fp8: DeviceBuffer[FP8],
+    w: TileTensor[mut=False, dtype=FP8, ...],
+    w_scale: TileTensor[mut=False, dtype = DType.float32, ...],
+    act_scale: DeviceBuffer[DType.float32],
+    m: Int,
+    n: Int,
+    k: Int,
+    ctx: DeviceContext,
+) raises:
+    """Prefill W8A8: C = scale_act[:,None] * scale_w[None,:] * (A_fp8 @ W^T).
+
+    Requires n % 64 == 0, k % 16 == 0. M may be ragged (edge-masked).
+    """
+    debug_assert(m > 0, "wmma_gemm_fp8_prefill: m must be > 0")
+    debug_assert(n % BN == 0, "wmma_gemm_fp8_prefill: n must be divisible by 64")
+    debug_assert(k % BK == 0, "wmma_gemm_fp8_prefill: k must be divisible by 16")
+
+    comptime kernel = wmma_gemm_kernel_v3a_fp8[c_type, fuse_residual]
+    ctx.enqueue_function[kernel](
+        a_fp8.unsafe_ptr().as_immutable().as_unsafe_any_origin(),
+        w.ptr.as_immutable().as_unsafe_any_origin(),
+        w_scale.ptr.as_immutable().as_unsafe_any_origin(),
+        act_scale.unsafe_ptr().as_immutable().as_unsafe_any_origin(),
+        c.ptr.as_unsafe_any_origin(),
+        m,
+        n,
+        k,
+        grid_dim=(n // BN, ceildiv(m, BM)),
+        block_dim=(V3A_THREADS,),
+    )
