@@ -886,3 +886,134 @@ def wmma_gemm_fp8_prefill[
         grid_dim=(n // BN, ceildiv(m, BM)),
         block_dim=(V3A_THREADS,),
     )
+
+
+# ===----------------------------------------------------------------------=== #
+# FP8 small-M decode-batch GEMM (2 ≤ M ≤ M_SMALL_MAX) — no LDS on weights
+#
+# Mirrors decode GEMV load style (direct global fragments) but multi-row A.
+# BM_SM=16 / BN=64 / BK=16 / 1 wave: A fragment hoisted across 4 N-subcols.
+# Edge-masks M. N,K tile-aligned (model dims already %64 on BN).
+# LDS retained only on large-M v3a prefill path above.
+# ===----------------------------------------------------------------------=== #
+
+comptime BM_SM = 16
+comptime M_SMALL_MAX = 32
+comptime SM_SC = 4  # N sub-cols per wave (BN / WMMA_TILE)
+comptime SM_THREADS = WMMA_LANES  # 1 wave
+
+
+def wmma_fp8_small_m_kernel[
+    c_type: DType,
+    fuse_residual: Bool,
+](
+    a_ptr: UnsafePointer[Scalar[FP8], ImmutAnyOrigin],
+    w_ptr: UnsafePointer[Scalar[FP8], ImmutAnyOrigin],
+    w_scale_ptr: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
+    act_scale_ptr: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
+    c_ptr: UnsafePointer[Scalar[c_type], MutAnyOrigin],
+    M: Int,
+    N: Int,
+    K: Int,
+):
+    """Small-M W8A8: no LDS B staging; direct global A/B fragments; dual-scale.
+
+    One wave / block owns a 16×64 C tile. A is loaded once per K-strip and
+    reused across SM_SC N-subtiles (same reuse idea as v3a, without barriers).
+    """
+    var l = Int(thread_idx.x)
+    if l >= SM_THREADS:
+        return
+
+    var n_tile = Int(block_idx.x)
+    var m_tile = Int(block_idx.y)
+    var MB = m_tile * BM_SM
+    var NB = n_tile * BN
+
+    if MB >= M or NB >= N:
+        return
+
+    var row_or_col = l % WMMA_TILE
+    var half = l // WMMA_TILE
+
+    var acc = InlineArray[SIMD[DType.float32, WMMA_FRAG], SM_SC](
+        uninitialized=True
+    )
+    comptime for sc in range(SM_SC):
+        acc[sc] = SIMD[DType.float32, WMMA_FRAG](0.0)
+
+    var ks = 0
+    while ks < K:
+        # A: row-major fragment, M edge-mask (zero-fill).
+        var a_fp8 = SIMD[FP8, WMMA_FRAG](0)
+        var a_row = MB + row_or_col
+        if a_row < M:
+            var a_base = a_row * K + ks + half * WMMA_FRAG
+            a_fp8 = a_ptr.load[width=WMMA_FRAG](a_base)
+        var a_i32 = bitcast[DType.int32, 2](a_fp8)
+
+        # B: row-major global fragments (no LDS) for 4 N-subcols.
+        comptime for sc in range(SM_SC):
+            var w_row_base = (
+                (NB + sc * WMMA_TILE + row_or_col) * K + ks + half * WMMA_FRAG
+            )
+            var b_fp8 = w_ptr.load[width=WMMA_FRAG](w_row_base)
+            acc[sc] = wmma_fp8(
+                a_i32, bitcast[DType.int32, 2](b_fp8), acc[sc]
+            )
+
+        ks += BK
+
+    # Store: C[m,n] = act_scale[m] * w_scale[n] * acc  (+ residual)
+    comptime for sc in range(SM_SC):
+        comptime for j in range(WMMA_FRAG):
+            var m = MB + half * WMMA_FRAG + j
+            var n = NB + sc * WMMA_TILE + row_or_col
+            if m < M and n < N:
+                var val = acc[sc][j] * act_scale_ptr[m] * w_scale_ptr[n]
+                comptime if fuse_residual:
+                    val = val + c_ptr[m * N + n].cast[DType.float32]()
+                c_ptr[m * N + n] = val.cast[c_type]()
+
+
+def wmma_gemm_fp8_small_m[
+    c_type: DType, fuse_residual: Bool = False
+](
+    c: TileTensor[mut=True, dtype=c_type, ...],
+    a_fp8: DeviceBuffer[FP8],
+    w: TileTensor[mut=False, dtype=FP8, ...],
+    w_scale: TileTensor[mut=False, dtype = DType.float32, ...],
+    act_scale: DeviceBuffer[DType.float32],
+    m: Int,
+    n: Int,
+    k: Int,
+    ctx: DeviceContext,
+) raises:
+    """Small-M decode-batch W8A8: C = sa[:,None]*sw[None,:]*(A_fp8 @ W^T).
+
+    Requires 1 < m ≤ M_SMALL_MAX, n % 64 == 0, k % 16 == 0.
+    """
+    debug_assert(m > 1, "wmma_gemm_fp8_small_m: m must be > 1")
+    debug_assert(
+        m <= M_SMALL_MAX, "wmma_gemm_fp8_small_m: m exceeds M_SMALL_MAX"
+    )
+    debug_assert(
+        n % BN == 0, "wmma_gemm_fp8_small_m: n must be divisible by 64"
+    )
+    debug_assert(
+        k % BK == 0, "wmma_gemm_fp8_small_m: k must be divisible by 16"
+    )
+
+    comptime kernel = wmma_fp8_small_m_kernel[c_type, fuse_residual]
+    ctx.enqueue_function[kernel](
+        a_fp8.unsafe_ptr().as_immutable().as_unsafe_any_origin(),
+        w.ptr.as_immutable().as_unsafe_any_origin(),
+        w_scale.ptr.as_immutable().as_unsafe_any_origin(),
+        act_scale.unsafe_ptr().as_immutable().as_unsafe_any_origin(),
+        c.ptr.as_unsafe_any_origin(),
+        m,
+        n,
+        k,
+        grid_dim=(n // BN, ceildiv(m, BM_SM)),
+        block_dim=(SM_THREADS,),
+    )

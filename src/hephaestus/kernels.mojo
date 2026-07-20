@@ -30,11 +30,13 @@ from hephaestus.wmma_gfx12 import (
     BN,
     FP8,
     FP8_E4M3_MAX,
+    M_SMALL_MAX,
     WMMA_TILE,
     wmma_gemm_bf16,
     wmma_gemm_bf16_residual,
     wmma_gemm_fp8_decode,
     wmma_gemm_fp8_prefill,
+    wmma_gemm_fp8_small_m,
 )
 
 comptime BF16 = DType.bfloat16
@@ -423,7 +425,10 @@ def linear_fp8[
 ) raises:
     """C = A @ W^T via W8A8 FP8 WMMA.
 
-    M=1: decode gemv. M>1: v3a prefill when n%64 and k%16; else row-loop.
+    M=1: decode gemv.
+    2≤M≤M_SMALL_MAX: small-M no-LDS decode-batch GEMM (when n%64, k%16).
+    M>M_SMALL_MAX: v3a LDS prefill (when n%64, k%16).
+    Else: row-loop gemv.
     """
     if m == 1:
         gemv_fp8[c_type, False, swizzled_b](
@@ -443,9 +448,14 @@ def linear_fp8[
     if n % BN == 0 and k % WMMA_TILE == 0:
         if do_quantize:
             quantize_act_rows_fp8(a_fp8_ws, act_scale_ws, a, m, k, ctx)
-        wmma_gemm_fp8_prefill[c_type, False](
-            c, a_fp8_ws, w, scale, act_scale_ws, m, n, k, ctx
-        )
+        if m <= M_SMALL_MAX:
+            wmma_gemm_fp8_small_m[c_type, False](
+                c, a_fp8_ws, w, scale, act_scale_ws, m, n, k, ctx
+            )
+        else:
+            wmma_gemm_fp8_prefill[c_type, False](
+                c, a_fp8_ws, w, scale, act_scale_ws, m, n, k, ctx
+            )
         return
 
     for row in range(m):
@@ -495,9 +505,14 @@ def linear_add_residual_fp8[
     if n % BN == 0 and k % WMMA_TILE == 0:
         if do_quantize:
             quantize_act_rows_fp8(a_fp8_ws, act_scale_ws, a, m, k, ctx)
-        wmma_gemm_fp8_prefill[BF16, True](
-            residual, a_fp8_ws, w, scale, act_scale_ws, m, n, k, ctx
-        )
+        if m <= M_SMALL_MAX:
+            wmma_gemm_fp8_small_m[BF16, True](
+                residual, a_fp8_ws, w, scale, act_scale_ws, m, n, k, ctx
+            )
+        else:
+            wmma_gemm_fp8_prefill[BF16, True](
+                residual, a_fp8_ws, w, scale, act_scale_ws, m, n, k, ctx
+            )
         return
 
     for row in range(m):
