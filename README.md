@@ -4,7 +4,7 @@
 
 A lightweight, GUI-less LLM inference engine written in [Mojo](https://www.modular.com/mojo). Loads FP8 E4M3 **safetensors directly** — no GGUF, no conversion step, no translation layers — and feeds them straight to RDNA4's WMMA matrix units.
 
-> **Status: pre-alpha, Phase 1a complete (G1a-1/2/3 PASS), Phase 1b not started.** BF16 Qwen3-4B forward path works on RDNA4 and clears the Phase 1a gates. There is still no FP8 path, no HTTP server, and no general model support — not a drop-in llama.cpp replacement. Star and watch if the mission matters; come back when 1b numbers appear.
+> **Status: pre-alpha, Phase 1a complete (G1a-1/2/3 PASS), Phase 1b in progress.** BF16 Qwen3-4B forward path works on RDNA4 and clears the Phase 1a gates. **Native FP8 E4M3 WMMA is proven on gfx1201** (`experiments/exp3g_*`, via direct `llvm_intrinsic`) and a W8A8 FP8 decode path runs end-to-end at **97.4% argmax parity** vs the HF oracle -- but it is **not yet faster than llama.cpp Q8_0 decode** (0.36x; see `bench/` on branch `fp8-wmma-decode`). No HTTP server, no batching, no general model support -- not a drop-in llama.cpp replacement.
 
 [![Stars](https://img.shields.io/github/stars/NikoCloud/hephaestus?style=for-the-badge&color=e94560)](https://github.com/NikoCloud/hephaestus/stargazers)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-green?style=for-the-badge)](LICENSE)
@@ -55,7 +55,7 @@ Numbers are published as they're measured — including the losses. Baseline har
 | Phase | Goal | Gate | Status |
 |---|---|---|---|
 | **1a — It Thinks** | BF16 forward pass of Qwen3-4B; teacher-forced argmax fidelity vs HF; load ≤30s | ≥ 90% of llama.cpp F16 decode vs **original** 55.14 baseline (**≥ 49.6 tok/s**) | ✅ **PASS** — see `bench/1a.md`, `bench/1a-ab.md` |
-| **1b — The Thesis** | Native FP8 WMMA path, no FP32 fallback in any hot loop | PPL within 1% of BF16; ≥ llama.cpp Q8_0 decode; ≥ 1.5× its prefill at 4K | ⏳ entry cleared; not started |
+| **1b -- The Thesis** | Native FP8 WMMA path, no FP32 fallback in any hot loop | PPL within 1% of BF16; >= llama.cpp Q8_0 decode; >= 1.5x its prefill at 4K | in progress -- FP8 WMMA proven, W8A8 decode numerically correct (97.4%); speed gates not met |
 | **2 — The Multiplier** | Continuous batching, paged KV, HTTP serving | ≥ 3× aggregate throughput at 8 concurrent requests | ⏳ |
 | **3 — Ecosystem** | Layout-tagged loading, more architectures, the parking lot | — | ⏳ |
 
@@ -77,8 +77,8 @@ Measured 2026-07-13 post GPU-argmax fix (`bench/1a-ab.md`). llama.cpp F16 same c
 **Caveats you should not miss:**
 
 - G1a-2’s 90% bar is vs the **2026-07-11** llama.cpp 55.14 tok/s citation. Fresh llama.cpp on the same machine later measured ~62 tok/s; against *that* number Hephaestus is ~87% — see `bench/1a-ab.md` Finding 1.
-- Single architecture hard-coded (Qwen3 dense 4B). CLI only. No server, no batching, no FP8 yet.
-- Matmul/attention are hand-written/naive where WMMA is unavailable on this Mojo nightly for gfx1201 — FP8 WMMA is the 1b thesis, not a delivered path.
+- Single architecture hard-coded (Qwen3 dense 4B). CLI only. No server, no batching. The FP8 W8A8 decode path exists and is numerically correct, but is not yet competitive on speed.
+- BF16 and FP8 WMMA both execute on gfx1201 via **direct `llvm_intrinsic`**; the Mojo stdlib RDNA WMMA path is gfx11-only and unusable here (see DECISIONS 2026-07-13). Attention is hand-written and parallelized. The FP8 WMMA decode path is correct but bandwidth-limited at M=1.
 
 Why 90% and not parity in 1a: single-stream decode is memory-bandwidth-bound; the last 10% costs months and buys little. Phase 2 is where this engine is supposed to pull ahead — concurrency is the point, single-stream is the credential.
 

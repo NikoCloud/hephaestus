@@ -1,0 +1,12 @@
+    @parameter
+    ^~~~~~~~~~
+    comptime 
+d[ 0 ] = 16.0
+d[ 1 ] = 16.0
+d[ 2 ] = 16.0
+d[ 3 ] = 16.0
+d[ 4 ] = 16.0
+d[ 5 ] = 16.0
+d[ 6 ] = 16.0
+d[ 7 ] = 16.0
+EXP3g PASS: BF16 WMMA all-ones -> 16.0 on gfx1201

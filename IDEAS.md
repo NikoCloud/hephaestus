@@ -15,3 +15,4 @@
 | 2026-07-12 | Launch-overhead profiling + QK-norm fusion: high-value once batching arrives and reduction-order sensitivity matters less | Phase 2 | ✅ |
 | 2026-07-13 | Further attention parallelism (more warps; splitting the weighted-V-sum across warps, which needs a combine step and would touch reduction order) | Phase 2 | ✅ |
 | 2026-07-13 | Upstream / configure MAX AsyncRT VRAM pool size (first-buffer ~90% card reservation on R9700) | Phase 2 | ✅ |
+| 2026-07-19 | **Speculative decoding / MTP as a decode lever** -- ESDMAX measured 26.5 -> 55 tok/s single-stream on 2x R9700 (different, larger model; ratio is the signal, not the absolute). Also raises decode M above 1, which is precisely what makes the FP8 WMMA path efficient -- may rehabilitate the pillar-pure path. See `.agent/notes/2026-07-19_fp8-hardware-access-landscape.md` | Phase 1b/2 | YES |
