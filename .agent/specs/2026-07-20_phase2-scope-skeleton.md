@@ -67,9 +67,19 @@ upstream patches: **state the gate as % of roofline, report tok/s ratio as headl
   sitting at 40% of roofline). Pillar gate = does it multiply; competitive gate =
   is it good. (This reconciles, not silently replaces, the stated Pillar 2 gate —
   per the supersession convention.)
-- **Calibration anchor (practical ceiling, not synthetic):** llama npl=1 = 460 GB/s
-  (KV is 1.9% of bytes there — a pure weight sweep). Renormalize all efficiency to
-  460, not the synthetic 569. llama's droop is 100%→73%, not 81%→59%.
+- **Denominator: 569 GB/s throughout. One denominator, no renormalization.**
+  [SUPERSEDED 2026-07-20 — the earlier "460 GB/s practical ceiling" is retired.]
+  460 came from llama *ROCm* at npl=1 and was taken as the achievable ceiling on a
+  mixed weights+KV access pattern. The Vulkan co-measure disproves it: **Vulkan
+  reaches 530.7 GB/s at npl=1 — 93.3% of the synthetic 569 — on that same workload.**
+  460 was ROCm's *implementation limit*, not a hardware ceiling. All percentages in
+  this spec and in both bench tables are % of 569; do not renormalize.
+- **What 530.7 means (record it as a measurement, not a divisor):** (a) it
+  strengthens the M=1 thesis — at 93.3% of roofline single-stream there is
+  essentially nothing left there for anyone, now measured rather than argued;
+  (b) it raises the concurrency prize — ~531 GB/s is demonstrably reachable while
+  the best batched result is 416.5 GB/s (Vulkan @ npl=8), a ~22% gap that is the
+  Phase 2 opportunity stated in measured terms.
 - **Honest anchor (the distance to cover):** llama serves 16 streams on ~6.5 GB; our
   8-process probe used 32 GB. That gap is what fused batching must close.
 
@@ -102,9 +112,10 @@ flat curve here must NOT be read as "Phase 2 de-risked."
 
 **Probe exit:** a measured efficiency-vs-concurrency curve on our own engine, with
 the flat-vs-droop shape named AND its warrant stated (kernel/memory floor, not
-scheduler). This sets the *real* Phase 2 gate from a measured number, not the
-460-renormalized extrapolation (which is optimistic by construction — Opus's owned
-inconsistency).
+scheduler). This sets the *real* Phase 2 gate from a measured number on our own
+engine, rather than from any extrapolation off llama's curve — the reason the
+earlier 460-renormalization had to be retired is exactly that a number borrowed
+from one backend's implementation limit is not a property of the hardware.
 
 ## 5. FP8-KV integration gates (already satisfied, carried forward)
 
