@@ -40,7 +40,7 @@ else                                → row-loop gemv
 
 | Check | Result |
 |-------|--------|
-| Isolated GEMM small-M vs v3a (M=2,8,16,32; N∈{1024,2560,4096}) | **bit-exact** (`max_abs_diff=0`) — `src/qwen_small_m_gemm_smoke.mojo` |
+| Isolated GEMM small-M vs v3a (M=2,8,16,32; N∈{1024,2560,4096,9728,151936}; K∈{2560,4096,9728}) | **bit-exact** (`max_abs_diff=0`, gate tightened to `!=0`) — covers every shape the forward routes to small-M incl. gate/up, down_proj, lm_head — `src/qwen_small_m_gemm_smoke.mojo` |
 | Teacher-forced decode M=1 (oracle, 3×256) | **256 + 246 + 246 = 748/768 (97.4%)** ≥95% |
 | Path NC M=512 prefill | **253/253 launches tagged `v3a`** (small-M not taken) |
 | Path NC M∈{2..16} full forward | **253 launches**, weight bytes = **4 022 272 000** once (tag `smallm` during TEMP instrument) |
@@ -174,7 +174,8 @@ Raw: `/tmp/small_m_out/hephaestus.log`, `prefill.log`, `llama.log`, `tf.log`.
 ## Warrant
 
 This measures whether a **decode-batch-sized FP8 GEMM** can recover GEMV-class memory efficiency while keeping fused weight loads.  
-It does **not** prove continuous batching, ragged batching, paged KV, or that Phase 2 is done.  
+It does **not** prove continuous batching, ragged batching, paged KV, or that Phase 2 is done.
+These numbers are **forward-only** (no sampling) at **past=0** (empty context): the honest headline vs llama is therefore an *optimistic* register — add per-token argmax-over-151936 and the ratio softens from ~0.95× toward ~0.85×, and it gentles further as context grows because KV bandwidth is per-stream and does not amortize across M the way weights do. The generation step will produce the real end-to-end numbers; this is an inter-step register.  
 **PASS:** Phase 2’s kernel foundation for M-batch GEMM is honest; the prior 0.5×-of-llama gap at M=8 was the v3a LDS path at thin reuse, not failed amortization.
 
 ---

@@ -96,8 +96,9 @@ def run_case(m: Int, n: Int, k: Int, ctx: DeviceContext) raises:
     )
     var mad = max_abs_diff(c_sm, c_v3, m * n, ctx)
     print("  max_abs_diff_vs_v3a=", mad)
-    if mad > Float32(1e-3):
-        raise Error("small-M vs v3a mismatch")
+    # small-M and v3a share K-order + WMMA, so output must be bitwise identical.
+    if mad != Float32(0):
+        raise Error("small-M vs v3a mismatch (expected bit-exact)")
     print("  PASS")
 
 
@@ -109,4 +110,9 @@ def main() raises:
     run_case(8, 4096, 2560, ctx)
     run_case(8, 1024, 2560, ctx)
     run_case(32, 2560, 2560, ctx)
+    # Shapes the forward routes to small-M that were previously untested:
+    run_case(8, 2560, 4096, ctx)     # o_proj  (K=4096)
+    run_case(8, 2560, 9728, ctx)     # down_proj (K=9728, largest reduction)
+    run_case(8, 9728, 2560, ctx)     # gate/up  (N=9728)
+    run_case(8, 151936, 2560, ctx)   # lm_head  (N=151936)
     print("ALL PASS")
