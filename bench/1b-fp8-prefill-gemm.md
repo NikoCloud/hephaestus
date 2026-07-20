@@ -1,121 +1,103 @@
-# FP8 WMMA prefill GEMM (v3a W8A8)
+# FP8 WMMA prefill GEMM (v3a W8A8) — post attn-stopgap
 
-**Date:** 2026-07-19 (implementation) / **co-measure re-run 2026-07-19T23:35–23:37 EDT**  
-**Branch:** `fp8-prefill-gemm` (from main after v3a merge)  
-**Hardware:** GPU 0 R9700 gfx1201; both GPUs free before suite  
-**Env:** hephaestus-wmma-nightly  
-**GPU end temps:** edge 52°C / junction 56°C / mem 62°C (GPU0)
+**Branch:** `fp8-prefill-gemm` → **main**  
+**Env:** hephaestus-wmma-nightly · GPU 0 R9700 · free both GPUs before suite  
+**Canonical co-measure:** 2026-07-20T00:00 EDT (edge 49°C end)
 
-## Commits
+## Commits (landed on main)
 
-1. **`4a8b6bf`** — merge `v3a-profiling` into main (union map)
-2. **`b8ea868`** — FP8 v3a prefill GEMM + per-row quant + dual-scale epilogue
+1. `4a8b6bf` — merge v3a-profiling into main  
+2. `b8ea868` — FP8 v3a prefill GEMM  
+3. `c69b286` — pre-stopgap co-measure (serial attention baseline)  
+4. `4da2e63` — merge attn-stopgap  
+5. *(this)* — post-stopgap co-measure + main land
 
-## What landed
+## What is on main (must all be present)
+
+| Symbol | Role |
+|--------|------|
+| `wmma_gemm_kernel_v3a` | BF16 64×64 LDS prefill |
+| `attention_kernel_parallel` | Softmax+PV stopgap (default on) |
+| `wmma_gemm_fp8_prefill` / `wmma_gemm_kernel_v3a_fp8` | FP8 W8A8 prefill |
+| `quantize_act_rows_*` | Per-row act quant |
+| `linear_fp8` M>1 | Routes to FP8 v3a |
+
+---
+
+## Co-measured session (attn-stopgap + FP8 GEMM)
+
+**Order:** TF → FP8 prefill×3 → BF16 prefill×3 → FP8 decode×3 → llama Q8_0 pp512+tg128×5  
+**Raw:** `/tmp/attn_merge_commeasure/full.log`
+
+### Teacher-forced (merge + kernel gate)
+
+| Prompt | Matches |
+|--------|--------:|
+| 1 | 256/256 |
+| 2 | 246/256 |
+| 3 | 246/256 |
+| **Total** | **748/768 (97.4%)** ≥95% |
+
+### Prefill 512 (fwd-only tok/s)
+
+| Engine | rep1 | rep2 | rep3 | **mean** |
+|--------|-----:|-----:|-----:|---------:|
+| **Hephaestus FP8** | 1710.7 | 1695.4 | 1701.8 | **1702.6** |
+| **Hephaestus BF16** | 1365.9 | 1377.5 | 1387.4 | **1376.9** |
+| llama.cpp Q8_0 pp512 | — | — | — | **7838.8 ± 979** |
+
+### Decode (context)
+
+| Engine | mean tok/s |
+|--------|-----------:|
+| Hephaestus FP8 (10×256) | **66.1** |
+| llama Q8_0 tg128 | **109.76 ± 0.28** |
+
+### Ratios (honest)
+
+| Comparison | Value | Notes |
+|------------|------:|-------|
+| **FP8 / BF16 end-to-end prefill** | **1.24×** | Same session, same attention |
+| **FP8 GEMM / BF16 GEMM (backed out)** | **~1.47×** | Holding non-GEMM; serial-attn era math; stopgap does not change GEMM |
+| **FP8 vs llama Q8_0 pp512** | **0.22×** | Precision-matched; **not a win** |
+| **vs prior FP8 row-loop (~87)** | **~19.6×** | Real product win |
+
+**Do not** cite llama F16 ROCm pp512 (~1431) as competitive ground truth — known-weak path.  
+**Do** cite Q8_0 pp512 (~7839) for competitive position.
+
+### Phantom regression explained
+
+| Measurement | Tree | Prefill tok/s |
+|-------------|------|-------------:|
+| Co-measure baseline “1400” | v3a + **attn-stopgap** | ~1400 |
+| Pre-stopgap FP8 session BF16 | v3a **only** | **764** |
+| Historical v3a-profiling | v3a only | ~794 |
+| **This session BF16** | v3a + stopgap | **1377** |
+| **This session FP8** | v3a + stopgap + FP8 GEMM | **1703** |
+
+The “764 vs 1400” BF16 drop was **missing attention**, not a broken GEMM.  
+FP8/BF16 **1.13× end-to-end without stopgap** was attention-dominated; GEMM-only ~**1.47×**.
+
+### GEMM ratio headroom (next, not this PR)
+
+| Item | Note |
+|------|------|
+| Ideal FP8 compute edge | up to ~2× on pure matmul |
+| Measured GEMM ~1.47× | Below 2× |
+| Likely tax | **Per-matmul activation quant launch** (BF16 pays 0) |
+| Action | Flag for follow-up; **do not profile until merge measured** (done here) |
+
+---
+
+## Implementation summary
 
 | Piece | Role |
 |-------|------|
-| `wmma_gemm_kernel_v3a_fp8` | 64×64 LDS GEMM, FP8 packing (`v2i32`), edge-mask M |
-| `wmma_gemm_fp8_prefill` | Host launch; grid `(N/64, ceildiv(M,64))` |
-| `quantize_act_rows_*` | Per-row absmax BF16→E4M3 + `act_scale[M]` |
-| `linear_fp8` M>1 | Quant + v3a FP8 (replaces row-looped gemv) |
-| `linear_add_residual_fp8` M>1 | Same with fused residual |
-| `Activations` | `a_fp8_pad = max_seq×inter`, `act_scale = max_seq` |
+| `wmma_gemm_kernel_v3a_fp8` | LDS 64×64, dual-scale epilogue, edge-mask M |
+| `quantize_act_rows_*` | Per-row absmax (no pad-to-16) |
+| Decode path | Unchanged W8A8 gemv |
 
-Epilogue: `C[m,n] = act_scale[m] * weight_scale[n] * acc` (+ residual).  
-LDS **kept** (prefill reuses tiles). Decode path unchanged.
-
----
-
-## Co-measured session (canonical numbers)
-
-**Procedure:** rebuild binaries → free GPUs → Hephaestus FP8/BF16 prefill → ragged → TF → **immediately** `llama-bench` Q8_0 then F16 on same GPU (`HIP_VISIBLE_DEVICES=0`, ROCm backend).  
-Raw log: `/tmp/fp8_prefill_commeasure/full.log`.
-
-### Hephaestus
-
-| Test | rep1 | rep2 | rep3 | mean |
-|------|-----:|-----:|-----:|-----:|
-| **FP8 prefill 512** (fwd tok/s) | 828.3 | 882.8 | 884.7 | **865.3** (warm 2–3: **883.7**) |
-| **BF16 prefill 512** (fwd tok/s) | 767.6 | 756.3 | 769.1 | **764.4** |
-| FP8 ragged M=137 prefill | — | — | — | **1161.3** (smoke) |
-
-| Teacher-forced FP8 (256 steps, oracle feed) | Matches |
-|---------------------------------------------|---------|
-| prompt1 | 256/256 |
-| prompt2 | 244/256 |
-| prompt3 | 242/256 |
-| **Total** | **742/768 (96.6%)** ≥95% |
-
-### llama.cpp (same session, ROCm, build `33ca0dcb9`)
-
-| Model | test | tok/s |
-|-------|------|------:|
-| **Q8_0** | pp512 | **7745 ± 1177** |
-| **Q8_0** | tg128 | **109.80 ± 0.36** |
-| **F16** | pp512 | **1431 ± 50** |
-| **F16** | tg128 | **61.99 ± 0.14** |
-
-**Backend note:** prior cross-day F16 prefill **~8134** was **Vulkan**. This co-measure is **ROCm**, where F16 pp512 is only **~1431**. Q8_0 pp512 remains high (~7745). Do not mix Vulkan and ROCm prefill numbers.
-
-### Ratios (this session only)
-
-| Comparison | Heph | llama (ROCm) | Ratio |
-|------------|-----:|-------------:|------:|
-| Prefill FP8 vs BF16 (Heph) | 865 | 764 | **1.13×** |
-| Prefill FP8 warm vs BF16 | 884 | 764 | **1.16×** |
-| Prefill FP8 vs llama F16 pp512 | 865 | 1431 | 0.60× |
-| Prefill FP8 vs llama Q8 pp512 | 865 | 7745 | 0.11× (not a gate) |
-
-llama prefill is **context**, not a gate (handoff: residual is kernel maturity / attention).
-
----
-
-## Merge validation (earlier same day, pre co-measure)
-
-| Gate | Result |
-|------|--------|
-| Build | clean |
-| FP8 TF | 748/768 (97.4%) |
-| BF16 prefill 512 | ~787 tok/s (v3a-profiling baseline ~794) |
-
-## Implementation gates (earlier same day)
-
-| Gate | Result |
-|------|--------|
-| Prefill M=512 (warm) | ~885 |
-| Ragged M=137 | runs |
-| BF16 routing after FP8 kernel | intact |
-
-### Speed rollup
-
-| Path | Prefill tok/s (M=512) |
-|------|---------------------:|
-| FP8 row-loop (before kernel) | ~87 |
-| BF16 v3a (this co-measure) | **764** |
-| **FP8 v3a W8A8 (this co-measure, all reps)** | **865** |
-| **FP8 warm (reps 2–3)** | **884** |
-| Target kernel parity | ~1400 |
-| llama ROCm F16 / Q8 pp512 | 1431 / 7745 — **not gates** |
-
-**~10×** over previous FP8 row-loop; **~1.13×** Hephaestus BF16 in the same thermal window.
-
-## Correctness note
-
-FP8 vs BF16 is expected arithmetic divergence. Argmax TF stays ≥95%.  
-No bit-identity claimed.
-
-## GPU condition takeaway
-
-| Variable | This session |
-|----------|----------------|
-| Idle before suite | yes (0% both GPUs) |
-| llama backend | ROCm (not Vulkan) |
-| End edge temp | 52°C |
-| Heph FP8 prefill cold rep1 | 828 (then ~884) |
-| llama Q8 pp512 σ | large (±1177) — first-rep / clock ramp |
-
-Re-running llama in the same session is required for fair ratios; historical Vulkan 8k prefill is a different stack.
+Epilogue: `C[m,n] = act_scale[m] * weight_scale[n] * acc` (+ residual).
 
 ## Reproduce
 
@@ -124,7 +106,7 @@ export HIP_VISIBLE_DEVICES=0
 export CONDA_PREFIX=~/projects/hephaestus-wmma-nightly/.pixi/envs/default
 export MODULAR_HOME=$CONDA_PREFIX/share/max
 export PATH=$CONDA_PREFIX/bin:$PATH
-cd ~/projects/hephaestus
+cd ~/projects/hephaestus  # on main after land
 
 mojo build -I ~/projects/modular/max/kernels/src -I src \
   src/qwen_ab_bench_fp8.mojo -o /tmp/qwen_ab_fp8_pre
@@ -136,6 +118,4 @@ for r in 1 2 3; do /tmp/qwen_ab_bf16 bench/ab_prompt_long_ids.txt 4; done
 
 ~/projects/llama.cpp/build/bin/llama-bench \
   -m /mnt/models/models/qwen3-4b-instruct-2507-q8_0.gguf -p 512 -n 128 -r 5 -d 0
-~/projects/llama.cpp/build/bin/llama-bench \
-  -m /mnt/models/models/qwen3-4b-instruct-2507-f16.gguf -p 512 -n 128 -r 5 -d 0
 ```
