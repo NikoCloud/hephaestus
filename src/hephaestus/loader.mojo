@@ -362,7 +362,7 @@ def load_arena_bytes(ctx: DeviceContext, prefix: String) raises -> WeightArenaBy
         buf=dev^, entries=entries^, index=index^, total_bytes=total_bytes
     )
     # Set False to keep row-major weights (debug / A-B vs swizzled).
-    comptime DO_FP8_WMMA_SWIZZLE = True
+    comptime DO_FP8_WMMA_SWIZZLE = False
     comptime if DO_FP8_WMMA_SWIZZLE:
         swizzle_fp8_projection_weights(ctx, arena)
     return arena^

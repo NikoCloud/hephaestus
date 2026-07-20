@@ -209,7 +209,7 @@ def quantize_act_fp8_pad(
 def gemv_fp8[
     c_type: DType,
     add_residual: Bool = False,
-    swizzled_b: Bool = True,
+    swizzled_b: Bool = False,
 ](
     c: TileTensor[mut=True, dtype=c_type, ...],
     a: TileTensor[mut=False, dtype=BF16, ...],
@@ -245,7 +245,7 @@ def gemv_fp8[
 
 
 def linear_fp8[
-    c_type: DType, swizzled_b: Bool = True
+    c_type: DType, swizzled_b: Bool = False
 ](
     c: TileTensor[mut=True, dtype=c_type, ...],
     a: TileTensor[mut=False, dtype=BF16, ...],
@@ -289,7 +289,7 @@ def linear_fp8[
 
 
 def linear_add_residual_fp8[
-    swizzled_b: Bool = True
+    swizzled_b: Bool = False
 ](
     residual: TileTensor[mut=True, dtype=BF16, ...],
     a: TileTensor[mut=False, dtype=BF16, ...],
