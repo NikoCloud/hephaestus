@@ -74,7 +74,7 @@ Single-stream: Vulkan tg128 127.06 vs ROCm 109.39 = **+16%**. Batched prefill: V
 
 **(c) Best-in-class is an envelope across two backends that no user gets from one build.** Vulkan owns decode ≤8; ROCm owns decode at 16 and batched prefill throughout. State it as an envelope — more accurate than picking whichever flatters us, and more defensible when someone re-tests.
 
-### The 460 GB/s anchor is superseded — action required on the skeleton
+### The 460 GB/s anchor is superseded — RESOLVED in `3072b4a`
 
 Earlier sizing used **460 GB/s** as the "practical ceiling" (llama ROCm at npl=1, where KV is 1.9% of bytes — effectively a pure weight sweep), on the reasoning that the synthetic 569 is unreachable on a mixed access pattern.
 
@@ -82,7 +82,7 @@ Earlier sizing used **460 GB/s** as the "practical ceiling" (llama ROCm at npl=1
 
 Consequences:
 
-1. **`.agent/specs/2026-07-20_phase2-scope-skeleton.md` §3 has a live contradiction.** Its gate bullet quotes 569-based percentages (73% @ npl=8, 59% @ npl=16 — the figures in both bench tables), while its calibration bullet instructs renormalizing everything to 460. Two denominators in one gate. **Fix: use 569 throughout**, one denominator, consistent with both bench docs. Record 530.7 as best-measured-achievable rather than as a divisor.
+1. **Skeleton §3 had a live contradiction — now fixed.** Its gate bullet quoted 569-based percentages (73% @ npl=8, 59% @ npl=16 — the figures in both bench tables) while its calibration bullet instructed renormalizing to 460. Two denominators in one gate. Resolved in `3072b4a`: **569 throughout, one denominator**, consistent with both bench tables; 460 marked SUPERSEDED in place; 530.7 recorded as a measurement rather than a divisor.
 2. **This strengthens rather than weakens the M=1 thesis.** Vulkan at 93.3% of synthetic roofline single-stream means there is essentially nothing left there for anyone. "No 2× hiding at M=1" is now measured, not argued.
 3. **It also raises the concurrency prize.** If ~531 GB/s is demonstrably reachable and the best batched result is 416.5 (Vulkan @ npl=8), the gap between what the memory system can do and what batched serving extracts is ~22% — and ROCm gives up even more. That gap is the Phase 2 opportunity, stated in measured terms.
 
@@ -104,8 +104,8 @@ ROCm pp512 stddev is ±864 and ±1310 (11–17%, cold first rep per process); Vu
 
 ## 4. Open items
 
-1. Skeleton §3: resolve the 569/460 double denominator per §2 above. **Blocking** — the probe spec inherits this gate.
-2. Phase 2 pre-build concurrency-shape probe → sets the real gate from a measured curve.
+1. ~~Skeleton §3: resolve the 569/460 double denominator.~~ **Done — `3072b4a`.** Gates now state % of 569 throughout; the probe spec inherits a single denominator.
+2. Phase 2 pre-build concurrency-shape probe → sets the real gate from a measured curve. **Next.**
 3. Phase 1b writeup / Modular forum post, led by the **ABI contribution**, not benchmarks. Drafted comment at `.agent/notes/upstream-6722-comment.md`. No batching claim in it.
 4. Act-quant fusion (GEMM 1.47 → 2.0 gap). One fusion at a time, teacher-forced after each.
 
