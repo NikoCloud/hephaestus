@@ -27,12 +27,14 @@ from linalg.gemv import gemv_gpu
 from linalg.matmul.gpu import matmul_kernel_naive
 
 from hephaestus.wmma_gfx12 import (
+    BN,
     FP8,
     FP8_E4M3_MAX,
     WMMA_TILE,
     wmma_gemm_bf16,
     wmma_gemm_bf16_residual,
     wmma_gemm_fp8_decode,
+    wmma_gemm_fp8_prefill,
 )
 
 comptime BF16 = DType.bfloat16
@@ -207,6 +209,82 @@ def quantize_act_fp8_pad(
     )
 
 
+def quantize_act_rows_kernel(
+    a_fp8_ptr: UnsafePointer[Scalar[FP8], MutAnyOrigin],
+    scale_ptr: UnsafePointer[Scalar[F32], MutAnyOrigin],
+    x_ptr: UnsafePointer[Scalar[BF16], ImmutAnyOrigin],
+    M: Int,
+    K: Int,
+):
+    """Per-row absmax quant: BF16 A[M,K] → FP8 A_fp8[M,K] + act_scale[M].
+
+    One block per row; shared-mem tree reduce over K (no pad-to-16).
+    """
+    var row = Int(block_idx.x)
+    if row >= M:
+        return
+    var tid = Int(thread_idx.x)
+    var sh = stack_allocation[
+        QUANT_TPB, F32, address_space = AddressSpace.SHARED
+    ]()
+
+    var local = Float32(0)
+    var i = tid
+    var base = row * K
+    while i < K:
+        var v = x_ptr[base + i].cast[F32]()
+        if v < Float32(0):
+            v = -v
+        if v > local:
+            local = v
+        i += QUANT_TPB
+    sh[tid] = local
+    barrier()
+
+    var stride = QUANT_TPB // 2
+    while stride > 0:
+        if tid < stride:
+            var o = sh[tid + stride]
+            if o > sh[tid]:
+                sh[tid] = o
+        barrier()
+        stride //= 2
+
+    var max_abs = sh[0]
+    var scale = max_abs / FP8_E4M3_MAX
+    if scale < Float32(1e-12):
+        scale = Float32(1.0)
+    if tid == 0:
+        scale_ptr[row] = scale
+    barrier()
+
+    var inv = Float32(1.0) / scale
+    i = tid
+    while i < K:
+        a_fp8_ptr[base + i] = (x_ptr[base + i].cast[F32]() * inv).cast[FP8]()
+        i += QUANT_TPB
+
+
+def quantize_act_rows_fp8(
+    a_fp8: DeviceBuffer[FP8],
+    act_scale: DeviceBuffer[F32],
+    x: TileTensor[mut=False, dtype=BF16, ...],
+    m: Int,
+    k: Int,
+    ctx: DeviceContext,
+) raises:
+    """Quantize BF16 A[m,k] → FP8 + per-row scales (prefill, no pad)."""
+    ctx.enqueue_function[quantize_act_rows_kernel](
+        a_fp8.unsafe_ptr().unsafe_mut_cast[True]().as_unsafe_any_origin(),
+        act_scale.unsafe_ptr().unsafe_mut_cast[True]().as_unsafe_any_origin(),
+        x.ptr.as_immutable().as_unsafe_any_origin(),
+        m,
+        k,
+        grid_dim=(m,),
+        block_dim=(QUANT_TPB,),
+    )
+
+
 def gemv_fp8[
     c_type: DType,
     add_residual: Bool = False,
@@ -261,7 +339,10 @@ def linear_fp8[
     *,
     do_quantize: Bool = True,
 ) raises:
-    """C = A @ W^T via W8A8 FP8 WMMA (decode M=1). Prefill loops per row."""
+    """C = A @ W^T via W8A8 FP8 WMMA.
+
+    M=1: decode gemv. M>1: v3a prefill when n%64 and k%16; else row-loop.
+    """
     if m == 1:
         gemv_fp8[c_type, False, swizzled_b](
             c,
@@ -276,7 +357,15 @@ def linear_fp8[
             do_quantize=do_quantize,
         )
         return
-    # Row-at-a-time for short prefill correctness (not the prefill perf path).
+
+    if n % BN == 0 and k % WMMA_TILE == 0:
+        if do_quantize:
+            quantize_act_rows_fp8(a_fp8_ws, act_scale_ws, a, m, k, ctx)
+        wmma_gemm_fp8_prefill[c_type, False](
+            c, a_fp8_ws, w, scale, act_scale_ws, m, n, k, ctx
+        )
+        return
+
     for row in range(m):
         var a_row = TileTensor(
             ptr=a.ptr + row * k, layout=row_major(Coord(Index(1, k)))
@@ -320,6 +409,15 @@ def linear_add_residual_fp8[
             do_quantize=do_quantize,
         )
         return
+
+    if n % BN == 0 and k % WMMA_TILE == 0:
+        if do_quantize:
+            quantize_act_rows_fp8(a_fp8_ws, act_scale_ws, a, m, k, ctx)
+        wmma_gemm_fp8_prefill[BF16, True](
+            residual, a_fp8_ws, w, scale, act_scale_ws, m, n, k, ctx
+        )
+        return
+
     for row in range(m):
         var a_row = TileTensor(
             ptr=a.ptr + row * k, layout=row_major(Coord(Index(1, k)))
