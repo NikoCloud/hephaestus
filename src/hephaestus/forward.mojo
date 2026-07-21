@@ -23,6 +23,7 @@ from nn.normalization import rms_norm_gpu
 
 from hephaestus.kernels import (
     F32,
+    apply_rope_qk_fixed_pos,
     apply_rope_qk_inplace,
     attention,
     embed_lookup_fp8,
@@ -140,6 +141,59 @@ struct KVCache[n_layers: Int, kv_out: Int](Movable):
             Self.n_layers * MAX_KEYS * Self.kv_out
         )
         self.length = 0
+
+
+struct BatchedKVCache[n_layers: Int, kv_out: Int](Movable):
+    """Per-sequence KV caches in one allocation (fixed-M, synchronized lengths).
+
+    Layout: sequence-major slabs.
+      k/v: [max_batch][n_layers][MAX_KEYS][kv_out]
+    Sequence i never shares storage with sequence j — aliasing is structural
+    failure for Gate 1 / NC2.
+    """
+
+    var k: DeviceBuffer[BF16]
+    var v: DeviceBuffer[BF16]
+    var length: Int
+    var max_batch: Int
+    var batch: Int
+
+    def __init__(out self, ctx: DeviceContext, max_batch: Int) raises:
+        var slab = Self.n_layers * MAX_KEYS * Self.kv_out
+        self.k = ctx.enqueue_create_buffer[BF16](max_batch * slab)
+        self.v = ctx.enqueue_create_buffer[BF16](max_batch * slab)
+        self.length = 0
+        self.max_batch = max_batch
+        self.batch = max_batch
+
+    def set_batch(mut self, batch: Int) raises:
+        if batch < 1 or batch > self.max_batch:
+            raise Error("BatchedKVCache batch out of range")
+        self.batch = batch
+
+    def reset(mut self):
+        self.length = 0
+
+    def seq_slab(self) -> Int:
+        return Self.n_layers * MAX_KEYS * Self.kv_out
+
+    def layer_k_ptr(
+        mut self, seq_idx: Int, layer: Int
+    ) -> UnsafePointer[Scalar[BF16], MutAnyOrigin]:
+        var slab = self.seq_slab()
+        var layer_off = layer * MAX_KEYS * Self.kv_out
+        return (
+            self.k.unsafe_ptr() + seq_idx * slab + layer_off
+        ).unsafe_mut_cast[True]().as_unsafe_any_origin()
+
+    def layer_v_ptr(
+        mut self, seq_idx: Int, layer: Int
+    ) -> UnsafePointer[Scalar[BF16], MutAnyOrigin]:
+        var slab = self.seq_slab()
+        var layer_off = layer * MAX_KEYS * Self.kv_out
+        return (
+            self.v.unsafe_ptr() + seq_idx * slab + layer_off
+        ).unsafe_mut_cast[True]().as_unsafe_any_origin()
 
 
 def forward[
@@ -559,3 +613,259 @@ def forward_fp8[
     )
 
     cache.length = past + seq
+
+
+def forward_fp8_batched_decode[
+    vocab: Int,
+    hidden: Int,
+    q_out: Int,
+    kv_out: Int,
+    head_dim: Int,
+    inter: Int,
+    n_layers: Int,
+    n_heads: Int,
+    n_kv_heads: Int,
+    theta: Float64,
+](
+    weights: Qwen3WeightsFP8[
+        _, vocab, hidden, q_out, kv_out, head_dim, inter, n_layers
+    ],
+    mut acts: Activations[hidden, q_out, kv_out, inter, vocab],
+    mut caches: BatchedKVCache[n_layers, kv_out],
+    token_ids: DeviceBuffer[DType.int32],
+    batch: Int,
+    ctx: DeviceContext,
+) raises:
+    """One fused-M-row decode step for M independent sequences.
+
+    GEMMs: one M-row call per projection (small-M / gemv dispatch via linear_fp8).
+    Attention: per-sequence — row i attends only to caches[i], never to other rows.
+    RoPE: every row uses absolute position = caches.length (synchronized fixed-M).
+
+    token_ids length must be `batch` (one new token per sequence).
+    Advances caches.length by 1.
+    """
+    if batch < 1 or batch > caches.max_batch:
+        raise Error("forward_fp8_batched_decode: batch out of range")
+    if batch > acts.max_seq:
+        raise Error("forward_fp8_batched_decode: acts.max_seq < batch")
+    caches.set_batch(batch)
+
+    comptime group = n_heads // n_kv_heads
+    var past = caches.length
+    if past + 1 > MAX_KEYS:
+        raise Error("forward_fp8_batched_decode: exceeds MAX_KEYS")
+
+    var x = TileTensor(acts.x, row_major(Coord(Index(batch, hidden))))
+    embed_lookup_fp8(
+        x, weights.embed_tokens, weights.embed_scale, token_ids, batch, hidden, ctx
+    )
+
+    var xn = TileTensor(acts.xn, row_major(Coord(Index(batch, hidden))))
+    var q = TileTensor(acts.q, row_major(Coord(Index(batch, q_out))))
+    var k_scratch = TileTensor(acts.k, row_major(Coord(Index(batch, kv_out))))
+    var v_scratch = TileTensor(acts.v, row_major(Coord(Index(batch, kv_out))))
+    var attn_out = TileTensor(acts.attn_out, row_major(Coord(Index(batch, q_out))))
+    var gate = TileTensor(acts.gate, row_major(Coord(Index(batch, inter))))
+    var up = TileTensor(acts.up, row_major(Coord(Index(batch, inter))))
+    var act = TileTensor(acts.act, row_major(Coord(Index(batch, inter))))
+
+    for i in range(n_layers):
+        ref layer = weights.layers[i]
+
+        _rms_norm(
+            acts.xn.unsafe_ptr().as_unsafe_any_origin(),
+            acts.x.unsafe_ptr().as_unsafe_any_origin(),
+            layer.attn_norm,
+            batch,
+            hidden,
+            ctx,
+        )
+
+        # Fused M-row Q/K/V — weights read once; outputs land in scratch.
+        # K/V are NOT written straight into a shared cache (that would be
+        # prefill/causal multi-token semantics). Scatter into per-seq caches
+        # after RoPE below.
+        linear_fp8(
+            q,
+            xn,
+            layer.q_proj,
+            layer.q_proj_scale,
+            acts.a_fp8_pad,
+            acts.act_scale,
+            batch,
+            q_out,
+            hidden,
+            ctx,
+            do_quantize=True,
+        )
+        linear_fp8(
+            k_scratch,
+            xn,
+            layer.k_proj,
+            layer.k_proj_scale,
+            acts.a_fp8_pad,
+            acts.act_scale,
+            batch,
+            kv_out,
+            hidden,
+            ctx,
+            do_quantize=False,
+        )
+        linear_fp8(
+            v_scratch,
+            xn,
+            layer.v_proj,
+            layer.v_proj_scale,
+            acts.a_fp8_pad,
+            acts.act_scale,
+            batch,
+            kv_out,
+            hidden,
+            ctx,
+            do_quantize=False,
+        )
+
+        _rms_norm(
+            acts.q.unsafe_ptr().as_unsafe_any_origin(),
+            acts.q.unsafe_ptr().as_unsafe_any_origin(),
+            layer.q_norm,
+            batch * n_heads,
+            head_dim,
+            ctx,
+        )
+        _rms_norm(
+            acts.k.unsafe_ptr().as_unsafe_any_origin(),
+            acts.k.unsafe_ptr().as_unsafe_any_origin(),
+            layer.k_norm,
+            batch * n_kv_heads,
+            head_dim,
+            ctx,
+        )
+
+        # All M rows at absolute position `past` (independent sequences).
+        apply_rope_qk_fixed_pos[head_dim, theta](
+            acts.q.unsafe_ptr().as_unsafe_any_origin(),
+            acts.k.unsafe_ptr().as_unsafe_any_origin(),
+            n_heads,
+            n_kv_heads,
+            batch,
+            past,
+            ctx,
+        )
+
+        # Scatter post-RoPE K and post-proj V into each sequence's own slot.
+        for s in range(batch):
+            var k_dst = caches.layer_k_ptr(s, i) + past * kv_out
+            var v_dst = caches.layer_v_ptr(s, i) + past * kv_out
+            var k_src = acts.k.unsafe_ptr() + s * kv_out
+            var v_src = acts.v.unsafe_ptr() + s * kv_out
+            ctx.enqueue_copy(k_dst, k_src, kv_out)
+            ctx.enqueue_copy(v_dst, v_src, kv_out)
+
+        # Per-sequence attention: row s sees only caches[s], past keys + this.
+        for s in range(batch):
+            attention[head_dim, group](
+                (acts.attn_out.unsafe_ptr() + s * q_out).as_unsafe_any_origin(),
+                (acts.q.unsafe_ptr() + s * q_out)
+                .as_immutable()
+                .as_unsafe_any_origin(),
+                caches.layer_k_ptr(s, i).as_immutable().as_unsafe_any_origin(),
+                caches.layer_v_ptr(s, i).as_immutable().as_unsafe_any_origin(),
+                n_heads,
+                n_kv_heads,
+                1,
+                past,
+                ctx,
+            )
+
+        linear_add_residual_fp8(
+            x,
+            attn_out,
+            layer.o_proj,
+            layer.o_proj_scale,
+            acts.a_fp8_pad,
+            acts.act_scale,
+            batch,
+            hidden,
+            q_out,
+            ctx,
+        )
+
+        _rms_norm(
+            acts.xn.unsafe_ptr().as_unsafe_any_origin(),
+            acts.x.unsafe_ptr().as_unsafe_any_origin(),
+            layer.ffn_norm,
+            batch,
+            hidden,
+            ctx,
+        )
+        linear_fp8(
+            gate,
+            xn,
+            layer.gate_proj,
+            layer.gate_proj_scale,
+            acts.a_fp8_pad,
+            acts.act_scale,
+            batch,
+            inter,
+            hidden,
+            ctx,
+            do_quantize=True,
+        )
+        linear_fp8(
+            up,
+            xn,
+            layer.up_proj,
+            layer.up_proj_scale,
+            acts.a_fp8_pad,
+            acts.act_scale,
+            batch,
+            inter,
+            hidden,
+            ctx,
+            do_quantize=False,
+        )
+        silu_mul(
+            acts.act.unsafe_ptr().as_unsafe_any_origin(),
+            acts.gate.unsafe_ptr().as_unsafe_any_origin(),
+            acts.up.unsafe_ptr().as_unsafe_any_origin(),
+            batch * inter,
+            ctx,
+        )
+        linear_add_residual_fp8(
+            x,
+            act,
+            layer.down_proj,
+            layer.down_proj_scale,
+            acts.a_fp8_pad,
+            acts.act_scale,
+            batch,
+            hidden,
+            inter,
+            ctx,
+        )
+
+    _rms_norm(
+        acts.xn.unsafe_ptr().as_unsafe_any_origin(),
+        acts.x.unsafe_ptr().as_unsafe_any_origin(),
+        weights.output_norm,
+        batch,
+        hidden,
+        ctx,
+    )
+    var logits = TileTensor(acts.logits, row_major(Coord(Index(batch, vocab))))
+    linear_fp8[F32, False](
+        logits,
+        xn,
+        weights.embed_tokens,
+        weights.embed_scale,
+        acts.a_fp8_pad,
+        acts.act_scale,
+        batch,
+        vocab,
+        hidden,
+        ctx,
+    )
+
+    caches.length = past + 1

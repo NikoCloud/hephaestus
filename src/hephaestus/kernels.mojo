@@ -788,6 +788,96 @@ def apply_rope_qk_inplace[
     )
 
 
+# ===----------------------------------------------------------------------=== #
+# Batched-decode RoPE: M independent sequences at the SAME absolute position.
+# Prefill-style rope_kernel_qk assigns pos = tok + offset (causal multi-token
+# of one sequence). Batched decode must NOT do that — each row is its own
+# sequence, all at `pos`.
+# ===----------------------------------------------------------------------=== #
+
+
+def rope_kernel_qk_fixed_pos[
+    head_dim: Int, theta: Float64
+](
+    q_ptr: UnsafePointer[Scalar[BF16], MutAnyOrigin],
+    k_ptr: UnsafePointer[Scalar[BF16], MutAnyOrigin],
+    n_heads: Int,
+    n_kv_heads: Int,
+    batch: Int,
+    pos: Int,
+):
+    """Same math as rope_kernel_qk, but every row uses absolute position `pos`."""
+    var half = head_dim // 2
+    var gid = Int(block_idx.x * block_dim.x + thread_idx.x)
+    var total_q = batch * n_heads * half
+
+    var x: UnsafePointer[Scalar[BF16], MutAnyOrigin]
+    var n: Int
+    var local_gid: Int
+    if gid < total_q:
+        x = q_ptr
+        n = n_heads
+        local_gid = gid
+    else:
+        var total_k = batch * n_kv_heads * half
+        if gid >= total_q + total_k:
+            return
+        x = k_ptr
+        n = n_kv_heads
+        local_gid = gid - total_q
+
+    var pair = local_gid % half
+    var rest = local_gid // half
+    var head = rest % n
+    var tok = rest // n
+
+    var i_re = pair
+    var i_im = pair + half
+    var base = (tok * n + head) * head_dim
+    # Fixed absolute position for every batch row (not tok + pos).
+    var freq = Float32(
+        Float64(pos) * (theta ** (-2.0 * Float64(pair) / Float64(head_dim)))
+    )
+    var cos_v = cos(freq).cast[BF16]()
+    var sin_v = sin(freq).cast[BF16]()
+
+    var re = x[base + i_re]
+    var im = x[base + i_im]
+    var re_c = (re.cast[F32]() * cos_v.cast[F32]()).cast[BF16]()
+    var im_s = (im.cast[F32]() * sin_v.cast[F32]()).cast[BF16]()
+    var im_c = (im.cast[F32]() * cos_v.cast[F32]()).cast[BF16]()
+    var re_s = (re.cast[F32]() * sin_v.cast[F32]()).cast[BF16]()
+    x[base + i_re] = (re_c.cast[F32]() - im_s.cast[F32]()).cast[BF16]()
+    x[base + i_im] = (im_c.cast[F32]() + re_s.cast[F32]()).cast[BF16]()
+
+
+def apply_rope_qk_fixed_pos[
+    head_dim: Int, theta: Float64
+](
+    q_ptr: UnsafePointer[Scalar[BF16], MutAnyOrigin],
+    k_ptr: UnsafePointer[Scalar[BF16], MutAnyOrigin],
+    n_heads: Int,
+    n_kv_heads: Int,
+    batch: Int,
+    pos: Int,
+    ctx: DeviceContext,
+) raises:
+    """RoPE for M independent decode rows that share the same absolute pos."""
+    comptime TPB = 256
+    var half = head_dim // 2
+    var total = batch * (n_heads + n_kv_heads) * half
+    ctx.enqueue_function[rope_kernel_qk_fixed_pos[head_dim, theta]](
+        q_ptr,
+        k_ptr,
+        n_heads,
+        n_kv_heads,
+        batch,
+        pos,
+        grid_dim=(ceildiv(total, TPB),),
+        block_dim=(TPB,),
+    )
+
+
 def apply_rope_inplace[
     head_dim: Int, theta: Float64
 ](
