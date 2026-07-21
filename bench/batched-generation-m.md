@@ -243,7 +243,7 @@ Raw logs: `/tmp/batched_gen_m/{gates,heph_bench2,llama_pre,llama_post}.log`.
 ```text
 EXIT:0
 BRANCH: probe/batched-generation-m
-SHA: 96c8ab4
+SHA: 718f0c3
 DELIVERABLE: bench/batched-generation-m.md
 PILLAR_M8: 2.17x  (report-only; <3x = stop-and-diagnose — serial per-seq attn at ctx=640)
 HEPH_M8_VS_LLAMA: 0.19x  (report-only)
